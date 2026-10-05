@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stingray-labeler"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight local COCO image annotation tool for the Stingray custom tow sled"
 readme = "README.md"
 requires-python = ">=3.10"
