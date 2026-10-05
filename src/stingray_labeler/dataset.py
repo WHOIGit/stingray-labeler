@@ -1,4 +1,4 @@
-"""COCO dataset and filesystem helpers used by the annotator."""
+"""Project data and filesystem helpers used by the annotator."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def is_verified(value: Any) -> bool:
 
 
 def dataset_image_path(root: Path, file_name: str) -> Path:
-    """Resolve a COCO image name directly inside the selected image folder."""
+    """Resolve an image name directly inside the selected image folder."""
     parts = [part for part in str(file_name).replace("\\", "/").split("/") if part]
     if not parts or ".." in parts:
         raise ValueError(f"Invalid image filename: {file_name}")
@@ -34,3 +34,4 @@ def directory_names(folder: Path) -> set[str]:
 def path_key(path: Path) -> str:
     """Normalize a path string without checking whether its target exists."""
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+

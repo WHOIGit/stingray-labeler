@@ -1,1 +1,2 @@
-"""Stingray COCO image annotation application."""
+"""Stingray Labeler desktop image annotation application."""
+

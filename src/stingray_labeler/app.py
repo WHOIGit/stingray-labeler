@@ -3,12 +3,13 @@
 import sys
 from PySide6.QtWidgets import QApplication
 
-from .window import CocoAnnotator
+from .window import ImageAnnotator
 
 
 def main() -> int:
     app = QApplication(sys.argv[:1])
-    window = CocoAnnotator()
+    window = ImageAnnotator()
     window.show()
     app.installEventFilter(window)
     return app.exec()
+

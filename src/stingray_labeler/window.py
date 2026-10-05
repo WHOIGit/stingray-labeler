@@ -1,4 +1,4 @@
-"""Main COCO annotation window and user workflows."""
+"""Main image annotation window and user workflows."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ try:
         QComboBox,
         QColorDialog,
         QDoubleSpinBox,
+        QDialog,
+        QDialogButtonBox,
         QFileDialog,
+        QFormLayout,
         QGraphicsItem,
         QGraphicsLineItem,
         QGraphicsPixmapItem,
@@ -41,22 +44,25 @@ try:
         QPushButton,
         QProgressDialog,
         QSlider,
+        QSpinBox,
         QSplitter,
         QVBoxLayout,
         QWidget,
         QWidgetAction,
     )
-    from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError as error:
     raise SystemExit("Install the GUI dependencies with: python -m pip install PySide6 Pillow") from error
 
 from .dataset import is_verified, dataset_image_path, directory_names, path_key
-from .graphics import AnnotationView, BoxItem, ImageRuler, ScaleBarItem, format_length
-from .image_processing import ImageAdjustmentWorker
+from .graphics import (
+    AnnotationView, BoxItem, ImageRuler, ScaleBarItem, format_length, scale_bar_lengths_mm,
+)
+from .image_processing import AutoLevelsWorker, ImageAdjustmentWorker, apply_image_adjustments
 
 
-class CocoAnnotator(QMainWindow):
-    """Browse, filter, edit, and save annotations in a COCO dataset."""
+class ImageAnnotator(QMainWindow):
+    """Browse, filter, edit, and save image annotations."""
 
     BACKGROUND_FILTER_ID = "__background_filter__"
 
@@ -65,7 +71,7 @@ class CocoAnnotator(QMainWindow):
         self.root: Path | None = None
         self.annotations_path: Path | None = None
         self.output_path: Path | None = None
-        self.coco: dict[str, Any] = {"images": [], "annotations": [], "categories": []}
+        self.annotation_data: dict[str, Any] = {"images": [], "annotations": [], "categories": []}
         self.images: list[dict[str, Any]] = []
         self.categories: dict[Any, str] = {}
         self.image_by_id: dict[Any, dict[str, Any]] = {}
@@ -89,6 +95,8 @@ class CocoAnnotator(QMainWindow):
         self._adjust_generation = 0
         self._adjust_cancel: threading.Event | None = None
         self._adjust_workers: dict[int, ImageAdjustmentWorker] = {}
+        self._auto_level_workers: dict[int, AutoLevelsWorker] = {}
+        self._auto_level_generation = 0
         self.adjustment_pool = QThreadPool(self)
         self.adjustment_pool.setMaxThreadCount(2)
         self.dirty = False
@@ -96,7 +104,7 @@ class CocoAnnotator(QMainWindow):
         self._undo_history: list[tuple[Any, list[dict[str, Any]]]] = []
         self._redo_history: list[tuple[Any, list[dict[str, Any]]]] = []
 
-        self.setWindowTitle("Stingray Label")
+        self.setWindowTitle("Stingray Labeler")
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "stingray_label_icon.png")))
         self.resize(1400, 900)
         self._build_ui()
@@ -111,14 +119,14 @@ class CocoAnnotator(QMainWindow):
         self.save_project_action = QAction("Save Project", self)
         self.save_project_action.setShortcut(QKeySequence("Ctrl+S"))
         self.save_project_action.setToolTip(
-            "Save the project JSON beside the image folder and include verified frames and frames with annotation work"
+            "Save the project JSON beside the image folder and include verified images and images with annotation work"
         )
         self.training_export_action = QAction("Export Training Dataset…", self)
         self.training_export_action.setToolTip(
-            "Export verified frames, verified ROIs, and explicitly marked background frames"
+            "Export verified images, verified boxes, and explicitly marked background images"
         )
         self.save_image_action = QAction("Save Image…", self)
-        self.save_rois_action = QAction("Save ROIs…", self)
+        self.save_rois_action = QAction("Export Crops…", self)
         self.exit_action = QAction("Exit", self)
         self.add_images_action.setEnabled(False)
         self.add_folder_action.setEnabled(False)
@@ -141,11 +149,11 @@ class CocoAnnotator(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
 
-        classes_menu = self.menuBar().addMenu("&Classes")
-        self.add_class_action = QAction("Add Class…", self)
-        self.rename_class_action = QAction("Rename Class…", self)
-        self.class_color_action = QAction("Class Color…", self)
-        self.import_classes_action = QAction("Import Classes from JSON…", self)
+        classes_menu = self.menuBar().addMenu("&Labels")
+        self.add_class_action = QAction("Add Label…", self)
+        self.rename_class_action = QAction("Rename Label…", self)
+        self.class_color_action = QAction("Label Color…", self)
+        self.import_classes_action = QAction("Import Labels from JSON…", self)
         self.import_classes_action.setEnabled(False)
         classes_menu.addAction(self.add_class_action)
         classes_menu.addAction(self.rename_class_action)
@@ -159,14 +167,14 @@ class CocoAnnotator(QMainWindow):
 
         sidebar = QWidget()
         side_layout = QVBoxLayout(sidebar)
-        side_layout.addWidget(QLabel("Find frame"))
+        side_layout.addWidget(QLabel("Find image"))
         self.frame_search = QLineEdit()
         self.frame_search.setPlaceholderText("Search filenames…")
         side_layout.addWidget(self.frame_search)
-        side_layout.addWidget(QLabel("Frames"))
+        side_layout.addWidget(QLabel("Images"))
         self.frame_list = QListWidget()
         side_layout.addWidget(self.frame_list, 1)
-        self.frame_stats = QLabel("No frame selected")
+        self.frame_stats = QLabel("No image selected")
         self.frame_stats.setWordWrap(True)
         side_layout.addWidget(self.frame_stats)
         class_buttons = QHBoxLayout()
@@ -178,20 +186,20 @@ class CocoAnnotator(QMainWindow):
         self.class_filter = QListWidget()
         self.class_filter.setMaximumHeight(150)
         side_layout.addWidget(self.class_filter)
-        side_layout.addWidget(QLabel("Frame verification"))
+        side_layout.addWidget(QLabel("Image verification"))
         self.frame_verification_filter = QComboBox()
-        self.frame_verification_filter.addItem("All frames", "all")
-        self.frame_verification_filter.addItem("Verified frames", "verified")
-        self.frame_verification_filter.addItem("Unverified frames", "unverified")
+        self.frame_verification_filter.addItem("All images", "all")
+        self.frame_verification_filter.addItem("Verified images", "verified")
+        self.frame_verification_filter.addItem("Unverified images", "unverified")
         side_layout.addWidget(self.frame_verification_filter)
-        side_layout.addWidget(QLabel("ROI verification"))
+        side_layout.addWidget(QLabel("Box verification"))
         self.verification_filter = QComboBox()
-        self.verification_filter.addItem("All ROIs", "all")
+        self.verification_filter.addItem("All boxes", "all")
         self.verification_filter.addItem("Verified", "verified")
         self.verification_filter.addItem("Unverified", "unverified")
         side_layout.addWidget(self.verification_filter)
-        self.previous_button = QPushButton("Previous frame")
-        self.next_button = QPushButton("Next frame")
+        self.previous_button = QPushButton("Previous image")
+        self.next_button = QPushButton("Next image")
         self.previous_button.setEnabled(False)
         self.next_button.setEnabled(False)
 
@@ -210,7 +218,14 @@ class CocoAnnotator(QMainWindow):
         self.pixel_resolution.setValue(40.0)
         self.pixel_resolution.setSuffix(" µm/px")
         scale_layout.addWidget(self.pixel_resolution)
-        scale_layout.addWidget(QLabel("Scale bar length"))
+        self.pixel_resolution.setToolTip("Physical distance represented by each source-image pixel; editable after calibration")
+        self.calibrate_scale_button = QPushButton("Calibrate from line…")
+        self.calibrate_scale_button.setCheckable(True)
+        self.calibrate_scale_button.setToolTip(
+            "Draw across a known dimension to calculate the image pixel resolution"
+        )
+        scale_layout.addWidget(self.calibrate_scale_button)
+        scale_layout.addWidget(QLabel("Scale bar length (auto-fits when needed)"))
         self.scale_bar_length = QDoubleSpinBox()
         self.scale_bar_length.setRange(0.001, 100000)
         self.scale_bar_length.setDecimals(3)
@@ -246,6 +261,35 @@ class CocoAnnotator(QMainWindow):
         contrast_row.addWidget(self.contrast_slider, 1)
         contrast_row.addWidget(self.contrast_value)
         levels_layout.addLayout(contrast_row)
+        gamma_row = QHBoxLayout()
+        gamma_row.addWidget(QLabel("Gamma"))
+        self.gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gamma_slider.setRange(25, 400)
+        self.gamma_slider.setValue(100)
+        self.gamma_value = QLabel("1.00")
+        gamma_row.addWidget(self.gamma_slider, 1)
+        gamma_row.addWidget(self.gamma_value)
+        levels_layout.addLayout(gamma_row)
+        levels_layout.addWidget(QLabel("Black / white points"))
+        black_white_row = QHBoxLayout()
+        self.black_point = QSpinBox()
+        self.black_point.setRange(0, 254)
+        self.black_point.setPrefix("Black ")
+        self.black_point.setValue(0)
+        self.white_point = QSpinBox()
+        self.white_point.setRange(1, 255)
+        self.white_point.setPrefix("White ")
+        self.white_point.setValue(255)
+        black_white_row.addWidget(self.black_point)
+        black_white_row.addWidget(self.white_point)
+        levels_layout.addLayout(black_white_row)
+        self.auto_levels_button = QPushButton("Auto levels for this image")
+        self.auto_levels_button.setToolTip(
+            "Estimate black and white points from this image only when requested"
+        )
+        levels_layout.addWidget(self.auto_levels_button)
+        self.invert_check = QCheckBox("Invert")
+        levels_layout.addWidget(self.invert_check)
         levels_widget.setMinimumWidth(340)
         levels_action = QWidgetAction(self.levels_menu)
         levels_action.setDefaultWidget(levels_widget)
@@ -309,32 +353,32 @@ class CocoAnnotator(QMainWindow):
 
         annotation_panel = QWidget()
         annotation_layout = QVBoxLayout(annotation_panel)
-        self.frame_verified_check = QCheckBox("Frame verified")
+        self.frame_verified_check = QCheckBox("Image verified")
         self.frame_verified_check.setEnabled(False)
-        self.frame_verified_check.setToolTip("Toggle frame verification (Shift+V)")
+        self.frame_verified_check.setToolTip("Toggle image verification (Shift+V)")
         annotation_layout.addWidget(self.frame_verified_check)
         annotation_layout.addWidget(QLabel("Add / edit box"))
         self.draw_button = QPushButton("Draw box")
         self.draw_button.setCheckable(True)
         self.draw_button.setToolTip("Draw a box (B); press Esc to cancel")
         annotation_layout.addWidget(self.draw_button)
-        self.background_check = QCheckBox("Background (no ROIs)")
+        self.background_check = QCheckBox("Background (no annotations)")
         self.background_check.setEnabled(False)
         annotation_layout.addWidget(self.background_check)
         annotation_layout.addWidget(QLabel("Selected annotation"))
-        annotation_layout.addWidget(QLabel("Class"))
+        annotation_layout.addWidget(QLabel("Label"))
         self.edit_class = QComboBox()
         self.edit_class.setEnabled(False)
         annotation_layout.addWidget(self.edit_class)
         self.edit_status = QCheckBox("Box verified")
         self.edit_status.setEnabled(False)
-        self.edit_status.setToolTip("Toggle verification for the selected ROI (V)")
+        self.edit_status.setToolTip("Toggle verification for the selected box (V)")
         annotation_layout.addWidget(self.edit_status)
         self.delete_button = QPushButton("Delete annotation")
         self.delete_button.setEnabled(False)
-        self.delete_button.setToolTip("Delete the selected ROI (Delete)")
+        self.delete_button.setToolTip("Delete the selected box (Delete)")
         annotation_layout.addWidget(self.delete_button)
-        annotation_layout.addWidget(QLabel("Annotations in frame"))
+        annotation_layout.addWidget(QLabel("Annotations in image"))
         self.annotation_list = QListWidget()
         annotation_layout.addWidget(self.annotation_list, 1)
         self.status_label = QLabel()
@@ -360,7 +404,15 @@ class CocoAnnotator(QMainWindow):
         self.next_button.clicked.connect(lambda: self._navigate_frames(1))
         self.brightness_slider.valueChanged.connect(self._brightness_changed)
         self.contrast_slider.valueChanged.connect(self._contrast_changed)
+        self.gamma_slider.valueChanged.connect(self._gamma_changed)
+        self.black_point.valueChanged.connect(self._levels_changed)
+        self.white_point.valueChanged.connect(self._levels_changed)
+        self.auto_levels_button.clicked.connect(self._auto_levels_requested)
+        self.invert_check.toggled.connect(self._adjustment_changed)
         self.view.rectangleCreated.connect(self._add_rectangle)
+        self.view.calibrationLineCreated.connect(self._calibrate_scale_from_line)
+        self.view.calibrationModeChanged.connect(self.calibrate_scale_button.setChecked)
+        self.calibrate_scale_button.toggled.connect(self._set_calibration_mode)
         self.draw_button.toggled.connect(self._set_draw_mode)
         self.frame_verified_check.toggled.connect(self._frame_verified_changed)
         self.background_check.toggled.connect(self._background_changed)
@@ -402,7 +454,7 @@ class CocoAnnotator(QMainWindow):
         background_item.setData(Qt.ItemDataRole.UserRole, self.BACKGROUND_FILTER_ID)
         background_item.setFlags(background_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         background_item.setCheckState(Qt.CheckState.Checked)
-        background_item.setToolTip("Frames reviewed and marked as background")
+        background_item.setToolTip("Images reviewed and marked as background")
         self.class_filter.addItem(background_item)
         for category_id, name in sorted(self.categories.items(), key=lambda pair: pair[1].lower()):
             item = QListWidgetItem(name)
@@ -411,30 +463,30 @@ class CocoAnnotator(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked)
             self.class_filter.addItem(item)
 
-    def _set_dataset(self, root: Path | None, coco: dict[str, Any], source_path: Path | None = None,
+    def _set_dataset(self, root: Path | None, annotation_data: dict[str, Any], source_path: Path | None = None,
                      *, keep_output: bool = False, keep_history: bool = False,
                      visible_image_ids: set[Any] | None = None) -> None:
-        if not isinstance(coco, dict) or not isinstance(coco.get("images", []), list):
-            raise ValueError("COCO data must be a JSON object with an images array")
-        if not isinstance(coco.get("categories", []), list):
-            raise ValueError("COCO categories must be an array")
-        images = coco.get("images", [])
+        if not isinstance(annotation_data, dict) or not isinstance(annotation_data.get("images", []), list):
+            raise ValueError("Project data must be a JSON object with an images array")
+        if not isinstance(annotation_data.get("categories", []), list):
+            raise ValueError("Labels must be a JSON array")
+        images = annotation_data.get("images", [])
         if any(
             not isinstance(image, dict) or "id" not in image
             or not isinstance(image.get("file_name"), str)
             for image in images
         ):
-            raise ValueError("Each COCO image must have an id and file_name")
+            raise ValueError("Each image entry must have an id and file_name")
         image_ids = [image["id"] for image in images]
         if len(set(image_ids)) != len(image_ids):
-            raise ValueError("Each COCO image must have a unique id")
-        categories = coco.get("categories", [])
+            raise ValueError("Image IDs must be unique")
+        categories = annotation_data.get("categories", [])
         if any(not isinstance(category, dict) or "id" not in category or "name" not in category
                for category in categories):
-            raise ValueError("Each COCO category must have an id and name")
-        annotations = coco.get("annotations", [])
+            raise ValueError("Each label entry must have an id and name")
+        annotations = annotation_data.get("annotations", [])
         if not isinstance(annotations, list):
-            raise ValueError("COCO annotations must be an array")
+            raise ValueError("Annotations must be a JSON array")
         known_ids = set(image_ids)
         for annotation in annotations:
             if not isinstance(annotation, dict) or annotation.get("image_id") not in known_ids:
@@ -454,6 +506,12 @@ class CocoAnnotator(QMainWindow):
         self._project_image_names = None
         self.brightness_slider.setValue(100)
         self.contrast_slider.setValue(100)
+        self.gamma_slider.setValue(100)
+        self.black_point.setValue(0)
+        self.white_point.setValue(255)
+        self.invert_check.setChecked(False)
+        self._auto_level_generation += 1
+        self.auto_levels_button.setEnabled(False)
         self.add_images_action.setEnabled(self.root is not None)
         self.add_folder_action.setEnabled(self.root is not None)
         self.save_project_action.setEnabled(self.root is not None)
@@ -463,11 +521,11 @@ class CocoAnnotator(QMainWindow):
         self.annotations_path = source_path.resolve() if source_path else None
         if not keep_output:
             self.output_path = None
-        self.coco = coco
-        self.images = self.coco.setdefault("images", [])
+        self.annotation_data = annotation_data
+        self.images = self.annotation_data.setdefault("images", [])
         self.categories = {
             category["id"]: category["name"]
-            for category in self.coco.setdefault("categories", [])
+            for category in self.annotation_data.setdefault("categories", [])
         }
         self.image_by_id = {image["id"]: image for image in self.images}
         self.source_paths_by_image = {}
@@ -491,10 +549,10 @@ class CocoAnnotator(QMainWindow):
         self.touched_image_ids = set()
         self.roi_counts_by_image = {image["id"]: {} for image in self.images}
         self.roi_totals = [0, 0]
-        load_count = len(self.images) + len(self.coco.setdefault("annotations", []))
+        load_count = len(self.images) + len(self.annotation_data.setdefault("annotations", []))
         progress = None
         if load_count >= 100:
-            progress = QProgressDialog("Indexing images and ROIs…", "Cancel", 0, load_count, self)
+            progress = QProgressDialog("Indexing images and boxes…", "Cancel", 0, load_count, self)
             progress.setWindowTitle("Loading annotations")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
@@ -505,9 +563,9 @@ class CocoAnnotator(QMainWindow):
             done += 1
             if progress and done % 100 == 0:
                 progress.setValue(done)
-                progress.setLabelText(f"Indexing images and ROIs…  {done:,} / {load_count:,}")
+                progress.setLabelText(f"Indexing images and boxes…  {done:,} / {load_count:,}")
                 QApplication.processEvents()
-        for annotation in self.coco["annotations"]:
+        for annotation in self.annotation_data["annotations"]:
             image_id = annotation.get("image_id")
             if image_id not in self.annotations_by_image:
                 if progress:
@@ -523,7 +581,7 @@ class CocoAnnotator(QMainWindow):
             done += 1
             if progress and done % 100 == 0:
                 progress.setValue(done)
-                progress.setLabelText(f"Indexing images and ROIs…  {done:,} / {load_count:,}")
+                progress.setLabelText(f"Indexing images and boxes…  {done:,} / {load_count:,}")
                 QApplication.processEvents()
         if imported_annotations:
             self.background_by_image = {
@@ -539,7 +597,7 @@ class CocoAnnotator(QMainWindow):
             progress.setValue(load_count)
             progress.close()
         self.next_annotation_id = max(
-            (int(annotation.get("id", 0)) for annotation in self.coco["annotations"]), default=0
+            (int(annotation.get("id", 0)) for annotation in self.annotation_data["annotations"]), default=0
         ) + 1
         self.dirty = False
         if not keep_history:
@@ -554,8 +612,8 @@ class CocoAnnotator(QMainWindow):
             self.edit_class.addItem(name, category_id)
         if not self.categories:
             self.edit_class.addItem("object", None)
-            self.edit_class.setToolTip("Placeholder only. Add a real class from the Classes menu.")
-            self.draw_button.setToolTip("Add a class from the Classes menu before drawing.")
+            self.edit_class.setToolTip("Placeholder only. Add a real label from the Labels menu.")
+            self.draw_button.setToolTip("Add a label from the Labels menu before drawing.")
         else:
             self.edit_class.setToolTip("")
             self.draw_button.setToolTip("")
@@ -570,7 +628,7 @@ class CocoAnnotator(QMainWindow):
         self.frame_verification_filter.setCurrentIndex(0)
         self.frame_verification_filter.blockSignals(False)
         self._sync_frame_controls()
-        self.setWindowTitle("Stingray Label" + (f" — {self.root}" if self.root else ""))
+        self.setWindowTitle("Stingray Labeler" + (f" — {self.root}" if self.root else ""))
         self.refresh_frame_list(show_progress=True)
         if not self.images:
             self._update_frame_stats()
@@ -590,9 +648,9 @@ class CocoAnnotator(QMainWindow):
             return not self.dirty
         return True
 
-    def _empty_coco(self) -> dict[str, Any]:
+    def _empty_annotation_data(self) -> dict[str, Any]:
         return {
-            "info": {"description": "Created with Stingray COCO Annotator"},
+            "info": {"description": "Created with Stingray Labeler"},
             "licenses": [], "images": [], "annotations": [], "categories": [],
         }
 
@@ -608,7 +666,7 @@ class CocoAnnotator(QMainWindow):
         paths = self._scan_image_folder(root)
         if paths is None:
             return
-        self._set_dataset(root, self._empty_coco())
+        self._set_dataset(root, self._empty_annotation_data())
         added, duplicates = self._add_source_images(paths, refresh=False)
         if duplicates:
             self._show_duplicate_summary(duplicates, added)
@@ -642,8 +700,8 @@ class CocoAnnotator(QMainWindow):
             annotations_file = Path(selected).resolve() if selected else None
         if annotations_file is not None:
             try:
-                coco = self._read_coco(annotations_file)
-                self._set_dataset(root, coco, annotations_file)
+                annotation_data = self._read_annotation_data(annotations_file)
+                self._set_dataset(root, annotation_data, annotations_file)
             except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as error:
                 QMessageBox.critical(self, "Cannot open project", str(error))
             return
@@ -660,7 +718,7 @@ class CocoAnnotator(QMainWindow):
         paths = self._scan_image_folder(root)
         if paths is None:
             return
-        self._set_dataset(root, self._empty_coco())
+        self._set_dataset(root, self._empty_annotation_data())
         added, duplicates = self._add_source_images(paths, refresh=False)
         if duplicates:
             self._show_duplicate_summary(duplicates, added)
@@ -777,7 +835,7 @@ class CocoAnnotator(QMainWindow):
                 except OSError as error:
                     QMessageBox.critical(self, "Could not save duplicate list", str(error))
 
-    def _read_coco(self, path: Path) -> dict[str, Any]:
+    def _read_annotation_data(self, path: Path) -> dict[str, Any]:
         size = path.stat().st_size
         progress = QProgressDialog("Reading annotations.json…", "Cancel", 0, max(1, size), self)
         progress.setWindowTitle("Loading annotations")
@@ -798,16 +856,16 @@ class CocoAnnotator(QMainWindow):
             progress.setRange(0, 0)
             progress.setLabelText("Parsing annotations.json…")
             QApplication.processEvents()
-            coco = json.loads(contents)
+            annotation_data = json.loads(contents)
         finally:
             progress.close()
-        if not isinstance(coco, dict) or not isinstance(coco.get("images"), list):
-            raise ValueError("COCO JSON must contain an images array")
-        for image in coco["images"]:
+        if not isinstance(annotation_data, dict) or not isinstance(annotation_data.get("images"), list):
+            raise ValueError("Annotation JSON must contain an images array")
+        for image in annotation_data["images"]:
             if not isinstance(image, dict) or not isinstance(image.get("file_name"), str):
-                raise ValueError("Each COCO image must have a file_name")
+                raise ValueError("Each image entry must have a file_name")
             image["file_name"] = image["file_name"].replace("\\", "/")
-        return coco
+        return annotation_data
 
     def _scan_image_folder(self, root: Path) -> list[Path] | None:
         extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -899,7 +957,7 @@ class CocoAnnotator(QMainWindow):
             self._refresh_annotation_list(selected_item)
             self._selection_changed()
         self._commit_current_scene()
-        self.coco["annotations"] = [
+        self.annotation_data["annotations"] = [
             annotation for image in self.images
             for annotation in self.annotations_by_image[image["id"]]
         ]
@@ -961,7 +1019,7 @@ class CocoAnnotator(QMainWindow):
         )
         progress = None
         if show_progress and len(self.images) >= 100:
-            progress = QProgressDialog("Building frame list…", "", 0, len(self.images), self)
+            progress = QProgressDialog("Building image list…", "", 0, len(self.images), self)
             progress.setWindowTitle("Loading images")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
@@ -1002,7 +1060,7 @@ class CocoAnnotator(QMainWindow):
                 self.frame_list.addItem(item)
             if progress and (index % 100 == 0 or index == len(self.images)):
                 progress.setValue(index)
-                progress.setLabelText(f"Building frame list…  {index:,} / {len(self.images):,}")
+                progress.setLabelText(f"Building image list…  {index:,} / {len(self.images):,}")
                 QApplication.processEvents()
         if progress:
             progress.close()
@@ -1055,12 +1113,12 @@ class CocoAnnotator(QMainWindow):
                 if verification in ("all", "unverified"):
                     unverified_filtered += counts[1]
         self.frame_stats.setText(
-            ("No frames match these filters\n" if self.images and not shown_ids else "")
-            + f"Frames: {self.frame_list.count():,} filtered / {len(self.images):,}\n"
-            f"Verified frames: {verified_frames:,} / {total_verified_frames:,}\n"
-            f"Unverified frames: {unverified_frames:,} / {total_unverified_frames:,}\n"
-            f"Verified ROIs: {verified_filtered:,} / {self.roi_totals[0]:,}\n"
-            f"Unverified ROIs: {unverified_filtered:,} / {self.roi_totals[1]:,}"
+            ("No images match these filters\n" if self.images and not shown_ids else "")
+            + f"Images: {self.frame_list.count():,} filtered / {len(self.images):,}\n"
+            f"Verified images: {verified_frames:,} / {total_verified_frames:,}\n"
+            f"Unverified images: {unverified_frames:,} / {total_unverified_frames:,}\n"
+            f"Verified boxes: {verified_filtered:,} / {self.roi_totals[0]:,}\n"
+            f"Unverified boxes: {unverified_filtered:,} / {self.roi_totals[1]:,}"
         )
         self._update_image_info()
 
@@ -1073,10 +1131,14 @@ class CocoAnnotator(QMainWindow):
         image_name = Path(image["file_name"]).name
         self.image_name_label.setText(image_name)
         self.image_name_label.setToolTip(image["file_name"])
+        width, height = self.base_image.size if self.base_image is not None else (
+            image.get("width", 0), image.get("height", 0)
+        )
         verified = sum(is_verified(item.annotation.get("verified", True)) for item in self.current_items)
         unverified = len(self.current_items) - verified
         self.image_info.setText(
-            f"ROIs: {len(self.current_items)}  |  Verified: {verified}  |  Unverified: {unverified}"
+            f"Image: {width:,} × {height:,} px  |  Boxes: {len(self.current_items)}  |  "
+            f"Verified: {verified}  |  Unverified: {unverified}"
         )
 
     def _update_rulers(self, *_args) -> None:
@@ -1085,6 +1147,50 @@ class CocoAnnotator(QMainWindow):
         self.left_ruler.resolution = resolution
         self.top_ruler.update()
         self.left_ruler.update()
+
+    def _set_calibration_mode(self, enabled: bool) -> None:
+        if enabled and self.base_image is None:
+            self.calibrate_scale_button.setChecked(False)
+            QMessageBox.information(self, "Calibrate scale", "Open an image before calibrating its scale.")
+            return
+        if enabled and self.draw_button.isChecked():
+            self.draw_button.setChecked(False)
+        self.view.set_calibration_mode(enabled)
+        if enabled:
+            self.status_label.setText("Draw a line across a known dimension. Press Esc to cancel.")
+
+    def _calibrate_scale_from_line(self, pixel_length: float) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Calibrate scale")
+        form = QFormLayout(dialog)
+        form.addRow("Measured line", QLabel(f"{pixel_length:.2f} pixels"))
+        length_input = QDoubleSpinBox()
+        length_input.setRange(0.000001, 100000000.0)
+        length_input.setDecimals(6)
+        length_input.setValue(1.0)
+        form.addRow("Known length", length_input)
+        unit_input = QComboBox()
+        unit_input.addItems(["µm", "mm", "cm", "m"])
+        unit_input.setCurrentText("mm")
+        form.addRow("Unit", unit_input)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Scale calibration canceled.")
+            return
+        known_length = length_input.value()
+        unit = unit_input.currentText()
+        micrometres_per_unit = {"µm": 1.0, "mm": 1000.0, "cm": 10000.0, "m": 1000000.0}
+        resolution = known_length * micrometres_per_unit[unit] / pixel_length
+        self.pixel_resolution.setValue(resolution)
+        self.status_label.setText(
+            f"Scale calibrated: {resolution:.3f} µm/px from {pixel_length:.2f} pixels = "
+            f"{known_length:g} {unit}. You can adjust Pixel resolution manually."
+        )
 
     def _set_ruler_visible(self, visible: bool) -> None:
         self.coordinate_readout.setVisible(visible)
@@ -1146,6 +1252,41 @@ class CocoAnnotator(QMainWindow):
         self.contrast_value.setText(f"{value}%")
         self.adjustment_timer.start()
 
+    def _gamma_changed(self, value: int) -> None:
+        self.gamma_value.setText(f"{value / 100:.2f}")
+        self.adjustment_timer.start()
+
+    def _levels_changed(self, value: int) -> None:
+        if self.sender() is self.black_point and value >= self.white_point.value():
+            self.white_point.setValue(min(255, value + 1))
+        elif self.sender() is self.white_point and value <= self.black_point.value():
+            self.black_point.setValue(max(0, value - 1))
+        self.adjustment_timer.start()
+
+    def _adjustment_changed(self, _checked: bool) -> None:
+        self.adjustment_timer.start()
+
+    def _auto_levels_requested(self) -> None:
+        if self.base_image is None:
+            return
+        self._auto_level_generation += 1
+        generation = self._auto_level_generation
+        worker = AutoLevelsWorker(generation, self.base_image)
+        worker.signals.levels_ready.connect(self._auto_levels_finished)
+        self._auto_level_workers[generation] = worker
+        self.auto_levels_button.setEnabled(False)
+        self.status_label.setText("Estimating levels for current image…")
+        self.adjustment_pool.start(worker)
+
+    def _auto_levels_finished(self, generation: int, black: int, white: int) -> None:
+        self._auto_level_workers.pop(generation, None)
+        if generation != self._auto_level_generation:
+            return
+        self.white_point.setValue(white)
+        self.black_point.setValue(black)
+        self.auto_levels_button.setEnabled(self.base_image is not None)
+        self.status_label.setText(f"Auto levels set for this image: black {black}, white {white}.")
+
     def _update_display_image(self) -> None:
         if self.base_image is None or self.background_item is None:
             return
@@ -1160,11 +1301,26 @@ class CocoAnnotator(QMainWindow):
             self.base_image,
             self.brightness_slider.value() / 100,
             self.contrast_slider.value() / 100,
+            self.gamma_slider.value() / 100,
+            self.invert_check.isChecked(),
+            self.black_point.value(),
+            self.white_point.value(),
             cancelled,
         )
         worker.signals.finished.connect(self._adjustment_finished)
         self._adjust_workers[generation] = worker
         self.adjustment_pool.start(worker)
+
+    def _apply_display_adjustments(self, image: Image.Image) -> Image.Image:
+        return apply_image_adjustments(
+            image,
+            self.brightness_slider.value() / 100,
+            self.contrast_slider.value() / 100,
+            self.gamma_slider.value() / 100,
+            self.invert_check.isChecked(),
+            self.black_point.value(),
+            self.white_point.value(),
+        )
 
     def _adjustment_finished(self, generation: int, image: QImage | None, scale: float) -> None:
         self._adjust_workers.pop(generation, None)
@@ -1181,42 +1337,76 @@ class CocoAnnotator(QMainWindow):
         self.scale_bar_item.length_mm = self.scale_bar_length.value()
         self.scale_bar_item.update()
 
-    def _draw_scale_bar(self, image: Image.Image, length_mm: float | None = None) -> bool:
+    def _draw_scale_bar(
+        self, image: Image.Image, length_mm: float | None = None,
+        corner: str = "bottom-right",
+    ) -> bool:
         pixel_resolution = self.pixel_resolution.value()
         if pixel_resolution <= 0:
             return False
         width, height = image.size
         margin = max(16, width / 80)
-        bar_width = (length_mm or self.scale_bar_length.value()) * 1000 / pixel_resolution
-        if bar_width <= 0 or bar_width > width - 2 * margin:
+        display_length_mm = length_mm or self.scale_bar_length.value()
+        available_width = min(width - 2 * margin, width * 0.5)
+        bar_width = display_length_mm * 1000 / pixel_resolution
+        if bar_width > available_width:
+            display_length_mm = next((length for length in scale_bar_lengths_mm()
+                                      if length <= display_length_mm
+                                      and length * 1000 / pixel_resolution <= available_width), 0)
+            if not display_length_mm:
+                return False
+            bar_width = display_length_mm * 1000 / pixel_resolution
+        if bar_width <= 0 or available_width <= 0:
             return False
         bar_height = max(5, width / 450)
-        left = width - margin - bar_width
-        top = height - margin - bar_height
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((left, top, left + bar_width, top + bar_height), fill="black")
-        label = format_length(length_mm or self.scale_bar_length.value())
+        label = format_length(display_length_mm)
         font_size = max(12, min(40, round(width / 50)))
         try:
             font = ImageFont.truetype("DejaVuSans.ttf", font_size)
         except OSError:
             font = ImageFont.load_default()
+        draw = ImageDraw.Draw(image)
         text_box = draw.textbbox((0, 0), label, font=font)
         label_width = text_box[2] - text_box[0]
         label_height = text_box[3] - text_box[1]
-        label_left = max(margin, min(left, width - margin - label_width))
-        label_top = max(0, top - label_height - 5)
+        right_corner = corner.endswith("right")
+        bottom_corner = corner.startswith("bottom")
+        left = width - margin - bar_width if right_corner else margin
+        top = height - margin - bar_height if bottom_corner else margin + label_height + 5
+        label_left = round(left + bar_width - label_width) if right_corner else round(left)
+        label_top = round(top - label_height - 5) if bottom_corner else round(margin)
+        draw.rectangle((left, top, left + bar_width, top + bar_height), fill="black")
         draw.text((label_left, label_top), label, fill="black", font=font)
         return True
 
-    def _roi_scale_length(self, roi_width: int) -> float:
+    def _scale_bar_export_options(self, layout: QFormLayout):
+        if not self.show_scale_bar.isChecked():
+            return None
+        corner = QComboBox()
+        for label, value in (
+            ("Bottom right", "bottom-right"),
+            ("Bottom left", "bottom-left"),
+            ("Top right", "top-right"),
+            ("Top left", "top-left"),
+        ):
+            corner.addItem(label, value)
+        length = QDoubleSpinBox()
+        length.setRange(0.001, 100000)
+        length.setDecimals(3)
+        length.setValue(self.scale_bar_length.value())
+        length.setSuffix(" mm")
+        layout.addRow("Scale bar corner", corner)
+        layout.addRow("Scale bar length", length)
+        return corner, length
+
+    def _roi_scale_length(self, roi_width: int, preferred_length_mm: float) -> float:
         resolution = self.pixel_resolution.value()
-        physical_width_mm = roi_width * resolution / 1000
-        margin = max(1, round(roi_width / 30))
-        maximum_bar_width = max(0, roi_width - 2 * margin)
-        return next((length for length in (10, 5, 1, 0.5, 0.1)
-                     if length * 0.6 <= physical_width_mm
-                     and length * 1000 / resolution <= maximum_bar_width), 0.1)
+        maximum_bar_width = roi_width * 0.5
+        if preferred_length_mm * 1000 / resolution <= maximum_bar_width:
+            return preferred_length_mm
+        return next((length for length in scale_bar_lengths_mm()
+                     if length <= preferred_length_mm
+                     and length * 1000 / resolution <= maximum_bar_width), 0.000001)
 
     def _source_image_path(self, image: dict[str, Any]) -> Path | None:
         image_id = image["id"]
@@ -1258,7 +1448,7 @@ class CocoAnnotator(QMainWindow):
         if not export_images:
             QMessageBox.information(
                 self, "Nothing to save yet",
-                "No verified frames or frames with annotation work are ready to save. "
+                "No verified images or images with annotation work are ready to save. "
                 "Untouched candidates from a folder scan stay out of the project JSON.",
             )
             return False
@@ -1326,13 +1516,13 @@ class CocoAnnotator(QMainWindow):
             annotation for annotation in export_annotations
             if annotation["image_id"] in exported_ids
         ]
-        project_coco = dict(self.coco)
-        project_coco["images"] = exported_images
-        project_coco["annotations"] = packaged_annotations
+        project_data = dict(self.annotation_data)
+        project_data["images"] = exported_images
+        project_data["annotations"] = packaged_annotations
         save_path = self.root.parent / "annotations.json"
         temporary_path = save_path.with_name(save_path.name + ".tmp")
         try:
-            temporary_path.write_text(json.dumps(project_coco, indent=2) + "\n", encoding="utf-8")
+            temporary_path.write_text(json.dumps(project_data, indent=2) + "\n", encoding="utf-8")
             temporary_path.replace(save_path)
         except OSError as error:
             QMessageBox.critical(self, "Save project failed", str(error))
@@ -1343,7 +1533,7 @@ class CocoAnnotator(QMainWindow):
         self.touched_image_ids.clear()
         self.dirty = False
         self.status_label.setText(
-            f"Saved {len(exported_images):,} frame(s) and {len(packaged_annotations):,} ROI(s) "
+            f"Saved {len(exported_images):,} image(s) and {len(packaged_annotations):,} annotation boxes "
             f"to {save_path}"
         )
         self.refresh_frame_list(preserve_scene=True)
@@ -1373,8 +1563,8 @@ class CocoAnnotator(QMainWindow):
 
         if not training_images:
             QMessageBox.information(
-                self, "No verified training frames",
-                "There are no verified frames with verified ROIs or an explicit background mark.",
+                self, "No verified training images",
+                "There are no verified images with verified boxes or an explicit background mark.",
             )
             return
 
@@ -1432,44 +1622,58 @@ class CocoAnnotator(QMainWindow):
             )
             return
 
-        export_coco = dict(self.coco)
-        export_coco["images"] = exported_images
+        export_data = dict(self.annotation_data)
+        export_data["images"] = exported_images
         exported_ids = {image["id"] for image in exported_images}
-        export_coco["annotations"] = [
+        export_data["annotations"] = [
             annotation for annotation in training_annotations
             if annotation["image_id"] in exported_ids
         ]
-        source_info = export_coco.get("info")
+        source_info = export_data.get("info")
         info = dict(source_info) if isinstance(source_info, dict) else {}
-        export_coco["info"] = info
+        export_data["info"] = info
         info["description"] = "Verified training subset exported from Stingray Label"
         save_path = destination.parent / "annotations.json"
         temporary_path = save_path.with_name(save_path.name + ".tmp")
         try:
             temporary_path.write_text(
-                json.dumps(export_coco, indent=2) + "\n", encoding="utf-8"
+                json.dumps(export_data, indent=2) + "\n", encoding="utf-8"
             )
             temporary_path.replace(save_path)
         except OSError as error:
             QMessageBox.critical(self, "Training export failed", str(error))
             return
         self.status_label.setText(
-            f"Exported {len(exported_images):,} verified frame(s) and "
-            f"{len(export_coco['annotations']):,} verified ROI(s) to {save_path}"
+            f"Exported {len(exported_images):,} verified image(s) and "
+            f"{len(export_data['annotations']):,} verified annotation boxes to {save_path}"
         )
 
     def export_frame(self) -> None:
         if self.current_image_id is None or self.base_image is None:
             return
+        scale_options = None
+        if self.show_scale_bar.isChecked():
+            options = QDialog(self)
+            options.setWindowTitle("Export Image Scale Bar")
+            options_layout = QFormLayout(options)
+            scale_options = self._scale_bar_export_options(options_layout)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(options.accept)
+            buttons.rejected.connect(options.reject)
+            options_layout.addRow(buttons)
+            if options.exec() != QDialog.DialogCode.Accepted:
+                return
         self._commit_current_scene()
         image_record = self.image_by_id[self.current_image_id]
         default_name = f"{Path(image_record['file_name']).stem}.png"
         output_path, _ = QFileDialog.getSaveFileName(
-            self, "Export frame", str(self.root / default_name), "PNG image (*.png)"
+            self, "Export image", str(self.root / default_name), "PNG image (*.png)"
         )
         if not output_path:
             return
-        exported = self.base_image.copy()
+        exported = self._apply_display_adjustments(self.base_image)
         draw = ImageDraw.Draw(exported)
         for item in self.current_items:
             x, y, width, height = item.scene_bbox()
@@ -1479,22 +1683,56 @@ class CocoAnnotator(QMainWindow):
                 outline=color,
                 width=max(4, exported.width // 700),
             )
-        if self.show_scale_bar.isChecked():
-            self._draw_scale_bar(exported)
+        if scale_options is not None:
+            scale_corner, scale_length = scale_options
+            self._draw_scale_bar(exported, scale_length.value(), scale_corner.currentData())
         try:
             exported.save(output_path, format="PNG")
         except OSError as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
-        self.status_label.setText(f"Exported frame: {output_path}")
+        self.status_label.setText(f"Exported image: {output_path}")
 
     def export_rois(self) -> None:
         if self.current_image_id is None or self.base_image is None:
             return
         if not self.current_items:
-            QMessageBox.information(self, "No annotations", "This frame has no boxes to export.")
+            QMessageBox.information(self, "No annotations", "This image has no boxes to export.")
             return
-        output_dir = QFileDialog.getExistingDirectory(self, "Choose ROI output folder", str(self.root))
+
+        padding = 0
+        scale_options = None
+        if self.show_scale_bar.isChecked():
+            options = QDialog(self)
+            options.setWindowTitle("Export Crops for Presentation")
+            options_layout = QVBoxLayout(options)
+            add_padding = QCheckBox("Add padding around each crop")
+            add_padding.setChecked(True)
+            options_layout.addWidget(add_padding)
+            padding_input = QSpinBox()
+            padding_input.setRange(0, 1000)
+            padding_input.setValue(50)
+            padding_input.setSuffix(" px per side")
+            padding_input.setToolTip("Padding is limited to source pixels available at image edges.")
+            options_layout.addWidget(padding_input)
+            options_layout.addWidget(QLabel(
+                "At image edges, padding is reduced to the source pixels available."
+            ))
+            add_padding.toggled.connect(padding_input.setEnabled)
+            scale_options_layout = QFormLayout()
+            scale_options = self._scale_bar_export_options(scale_options_layout)
+            options_layout.addLayout(scale_options_layout)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.accepted.connect(options.accept)
+            buttons.rejected.connect(options.reject)
+            options_layout.addWidget(buttons)
+            if options.exec() != QDialog.DialogCode.Accepted:
+                return
+            padding = padding_input.value() if add_padding.isChecked() else 0
+
+        output_dir = QFileDialog.getExistingDirectory(self, "Choose box output folder", str(self.root))
         if not output_dir:
             return
         self._commit_current_scene()
@@ -1508,9 +1746,19 @@ class CocoAnnotator(QMainWindow):
             bottom = min(self.base_image.height, math.ceil(y + height))
             if right <= left or bottom <= top:
                 continue
-            roi = self.base_image.crop((left, top, right, bottom))
-            if self.show_scale_bar.isChecked():
-                self._draw_scale_bar(roi, self._roi_scale_length(roi.width))
+            crop_left = max(0, left - padding)
+            crop_top = max(0, top - padding)
+            crop_right = min(self.base_image.width, right + padding)
+            crop_bottom = min(self.base_image.height, bottom + padding)
+            roi = self.base_image.crop((crop_left, crop_top, crop_right, crop_bottom))
+            roi = self._apply_display_adjustments(roi)
+            if scale_options is not None:
+                scale_corner, scale_length = scale_options
+                self._draw_scale_bar(
+                    roi,
+                    self._roi_scale_length(roi.width, scale_length.value()),
+                    scale_corner.currentData(),
+                )
             category = self.categories.get(item.annotation["category_id"], "unknown")
             safe_class = re.sub(r"[^a-zA-Z0-9_.-]+", "_", category)
             file_name = (
@@ -1520,14 +1768,18 @@ class CocoAnnotator(QMainWindow):
             try:
                 roi.save(Path(output_dir) / file_name, format="PNG")
             except OSError as error:
-                QMessageBox.critical(self, "ROI export failed", str(error))
+                QMessageBox.critical(self, "box export failed", str(error))
                 return
             saved += 1
-        self.status_label.setText(f"Exported {saved} ROI image(s) to {output_dir}")
+        self.status_label.setText(f"Exported {saved} box image(s) to {output_dir}")
 
     def _load_frame(self, image_id: Any) -> None:
         if image_id == self.current_image_id:
             return
+        self._auto_level_generation += 1
+        self.auto_levels_button.setEnabled(False)
+        if self.view.calibration_mode:
+            self.calibrate_scale_button.setChecked(False)
         self._commit_current_scene()
         self.view.clear_drawing_guides()
         self._cancel_image_adjustment()
@@ -1557,6 +1809,7 @@ class CocoAnnotator(QMainWindow):
             QMessageBox.critical(self, "Cannot load image", f"Could not open image:\n{path}")
             self.current_image_id = None
             return
+        self.auto_levels_button.setEnabled(True)
         image["width"] = self.base_image.width
         image["height"] = self.base_image.height
         self.background_item = QGraphicsPixmapItem()
@@ -1585,7 +1838,11 @@ class CocoAnnotator(QMainWindow):
         self._update_frame_stats()
 
     def _clear_scene(self) -> None:
+        if self.view.calibration_mode:
+            self.calibrate_scale_button.setChecked(False)
         self._commit_current_scene()
+        self._auto_level_generation += 1
+        self.auto_levels_button.setEnabled(False)
         self.view.clear_drawing_guides()
         self._cancel_image_adjustment()
         self.scene.clear()
@@ -1675,9 +1932,9 @@ class CocoAnnotator(QMainWindow):
         self.frame_verified_check.blockSignals(False)
         self.background_check.blockSignals(True)
         self.background_check.setChecked(
-            self.background_by_image.get(image_id, False) if active and not has_rois else False
+            self.background_by_image.get(image_id, False) if active else False
         )
-        self.background_check.setVisible(not has_rois)
+        self.background_check.setVisible(True)
         self.background_check.setEnabled(active and not has_rois)
         self.background_check.blockSignals(False)
         can_draw = active and bool(self.categories) and not self.background_by_image.get(image_id, False)
@@ -1694,7 +1951,7 @@ class CocoAnnotator(QMainWindow):
         self.frame_verified_by_image[image_id] = checked
         self.touched_image_ids.add(image_id)
         self.dirty = True
-        self.status_label.setText("Frame verification changed — unsaved changes")
+        self.status_label.setText("Image verification changed — unsaved changes")
         self.refresh_frame_list(preserve_scene=True)
 
     def _background_changed(self, checked: bool) -> None:
@@ -1737,7 +1994,7 @@ class CocoAnnotator(QMainWindow):
             return
         current_name = self.categories.get(self.edit_class.currentData(), names[0])
         name, accepted = QInputDialog.getItem(
-            self, "Choose box class", "Select an existing class:",
+            self, "Choose label", "Select an existing label:",
             names, names.index(current_name) if current_name in names else 0, False,
         )
         if not accepted or not name:
@@ -1848,12 +2105,12 @@ class CocoAnnotator(QMainWindow):
         self._mark_dirty(counts_changed=True)
 
     def _add_class(self) -> None:
-        name, accepted = QInputDialog.getText(self, "Add class", "New class name:")
+        name, accepted = QInputDialog.getText(self, "Add label", "New label name:")
         name = name.strip()
         if not accepted or not name:
             return
         if any(existing.casefold() == name.casefold() for existing in self.categories.values()):
-            QMessageBox.information(self, "Class already exists", f"The class {name!r} is already available.")
+            QMessageBox.information(self, "Label already exists", f"The label {name!r} is already available.")
             return
         self._create_class(name)
         self._mark_dirty()
@@ -1864,24 +2121,24 @@ class CocoAnnotator(QMainWindow):
             return
         start_path = self.annotations_path or self.root
         json_path, _ = QFileDialog.getOpenFileName(
-            self, "Import classes from COCO JSON", str(start_path), "JSON files (*.json)"
+            self, "Import labels from annotation JSON", str(start_path), "JSON files (*.json)"
         )
         if not json_path:
             return
         try:
-            coco = json.loads(Path(json_path).read_text(encoding="utf-8"))
-            if not isinstance(coco, dict) or not isinstance(coco.get("categories"), list):
+            annotation_data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+            if not isinstance(annotation_data, dict) or not isinstance(annotation_data.get("categories"), list):
                 raise ValueError("The selected JSON must contain a categories array.")
             names = []
-            for category in coco["categories"]:
+            for category in annotation_data["categories"]:
                 if not isinstance(category, dict) or not isinstance(category.get("name"), str):
-                    raise ValueError("Every category must have a name.")
+                raise ValueError("Every label must have a name.")
                 name = category["name"].strip()
                 if not name:
-                    raise ValueError("Category names cannot be empty.")
+                raise ValueError("Label names cannot be empty.")
                 names.append(name)
         except (OSError, json.JSONDecodeError, ValueError) as error:
-            QMessageBox.critical(self, "Cannot import classes", str(error))
+            QMessageBox.critical(self, "Cannot import labels", str(error))
             return
 
         existing = {name.casefold() for name in self.categories.values()}
@@ -1897,10 +2154,10 @@ class CocoAnnotator(QMainWindow):
             self._mark_dirty()
             self.refresh_frame_list()
             QMessageBox.information(
-                self, "Classes imported", f"Imported {len(added):,} class(es):\n" + ", ".join(added)
+                self, "Labels imported", f"Imported {len(added):,} label(s):\n" + ", ".join(added)
             )
         else:
-            QMessageBox.information(self, "Classes imported", "All classes already exist in this project.")
+            QMessageBox.information(self, "Labels imported", "All labels already exist in this project.")
 
     def _create_class(self, name: str) -> Any:
         numeric_ids = []
@@ -1911,7 +2168,7 @@ class CocoAnnotator(QMainWindow):
                 continue
         category_id = max(numeric_ids, default=0) + 1
         self.categories[category_id] = name
-        self.coco.setdefault("categories", []).append({"id": category_id, "name": name})
+        self.annotation_data.setdefault("categories", []).append({"id": category_id, "name": name})
         if self.edit_class.count() == 1 and self.edit_class.itemData(0) is None:
             self.edit_class.clear()
         self.edit_class.addItem(name, category_id)
@@ -1930,7 +2187,7 @@ class CocoAnnotator(QMainWindow):
         if not names:
             return
         old_name, accepted = QInputDialog.getItem(
-            self, "Rename class", "Select the class to rename:", names, 0, False
+            self, "Rename label", "Select the label to rename:", names, 0, False
         )
         if not accepted or not old_name:
             return
@@ -1938,7 +2195,7 @@ class CocoAnnotator(QMainWindow):
             key for key, existing in self.categories.items() if existing == old_name
         )
         name, accepted = QInputDialog.getText(
-            self, "Rename class", "Class name:", text=old_name
+            self, "Rename label", "Label name:", text=old_name
         )
         name = name.strip()
         if not accepted or not name or name == old_name:
@@ -1959,9 +2216,9 @@ class CocoAnnotator(QMainWindow):
             )
             answer = QMessageBox.question(
                 self,
-                "Merge classes?",
-                f"The class {name!r} already exists. Merge {old_name!r} into {name!r}?\n\n"
-                f"This will move {count:,} ROI(s) to {name!r} and remove {old_name!r} from this dataset.",
+                "Merge labels?",
+                f"The label {name!r} already exists. Merge {old_name!r} into {name!r}?\n\n"
+                f"This will move {count:,} annotation boxes to {name!r} and remove {old_name!r} from this dataset.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1970,7 +2227,7 @@ class CocoAnnotator(QMainWindow):
             return
 
         self.categories[category_id] = name
-        for category in self.coco.get("categories", []):
+        for category in self.annotation_data.get("categories", []):
             if category.get("id") == category_id:
                 category["name"] = name
                 break
@@ -1997,12 +2254,12 @@ class CocoAnnotator(QMainWindow):
             for annotation in annotations:
                 if annotation.get("category_id") == source_id:
                     annotation["category_id"] = target_id
-        self.coco["annotations"] = [
+        self.annotation_data["annotations"] = [
             annotation for image in self.images
             for annotation in self.annotations_by_image[image["id"]]
         ]
-        self.coco["categories"] = [
-            category for category in self.coco.get("categories", [])
+        self.annotation_data["categories"] = [
+            category for category in self.annotation_data.get("categories", [])
             if category.get("id") != source_id
         ]
         del self.categories[source_id]
@@ -2026,7 +2283,7 @@ class CocoAnnotator(QMainWindow):
         self._mark_dirty(counts_changed=True)
         self.refresh_frame_list(preserve_scene=True)
         self.status_label.setText(
-            f"Merged class {source_name!r} into {target_name!r} — unsaved changes"
+            f"Merged label {source_name!r} into {target_name!r} — unsaved changes"
         )
 
     def _choose_class_color(self) -> None:
@@ -2034,7 +2291,7 @@ class CocoAnnotator(QMainWindow):
         if not names:
             return
         name, accepted = QInputDialog.getItem(
-            self, "Class color", "Select a class:", names, 0, False
+            self, "Label color", "Select a label:", names, 0, False
         )
         if not accepted or not name:
             return
@@ -2070,6 +2327,12 @@ class CocoAnnotator(QMainWindow):
     def _reset_image_view(self) -> None:
         self.brightness_slider.setValue(100)
         self.contrast_slider.setValue(100)
+        self.gamma_slider.setValue(100)
+        self.black_point.setValue(0)
+        self.white_point.setValue(255)
+        self.invert_check.setChecked(False)
+        self._auto_level_generation += 1
+        self.auto_levels_button.setEnabled(self.base_image is not None)
         self.view._manual_zoom = False
         self.view.resetTransform()
         self.view.fit_image()
@@ -2109,6 +2372,7 @@ class CocoAnnotator(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
 
 
 
