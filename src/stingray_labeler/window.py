@@ -2132,10 +2132,10 @@ class ImageAnnotator(QMainWindow):
             names = []
             for category in annotation_data["categories"]:
                 if not isinstance(category, dict) or not isinstance(category.get("name"), str):
-                raise ValueError("Every label must have a name.")
+                    raise ValueError("Every label must have a name.")
                 name = category["name"].strip()
                 if not name:
-                raise ValueError("Label names cannot be empty.")
+                    raise ValueError("Label names cannot be empty.")
                 names.append(name)
         except (OSError, json.JSONDecodeError, ValueError) as error:
             QMessageBox.critical(self, "Cannot import labels", str(error))
