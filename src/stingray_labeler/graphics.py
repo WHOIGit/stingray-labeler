@@ -521,7 +521,8 @@ class AnnotationView(QGraphicsView):
         if self.draw_mode:
             self._update_crosshair(current_scene)
         if self._draw_start is not None and self._rubber_band is not None:
-            self._rubber_band.setRect(QRectF(self._draw_start, current_scene).normalized())
+            preview = QRectF(self._draw_start, current_scene).normalized()
+            self._rubber_band.setRect(preview.intersected(self.scene().sceneRect()))
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -544,7 +545,9 @@ class AnnotationView(QGraphicsView):
             event.accept()
             return
         if self._draw_start is not None and self._rubber_band is not None:
-            rect = self._rubber_band.rect().normalized()
+            end = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._draw_start, end).normalized().intersected(self.scene().sceneRect())
+            self._rubber_band.setRect(rect)
             self.scene().removeItem(self._rubber_band)
             self._rubber_band = None
             self._draw_start = None
