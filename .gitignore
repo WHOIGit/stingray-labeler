@@ -1,0 +1,10 @@
+# Local configuration and virtual environments
+.env
+.venv/
+
+# Generated build and Python cache files
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]

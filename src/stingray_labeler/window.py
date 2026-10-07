@@ -46,6 +46,7 @@ try:
         QSlider,
         QSpinBox,
         QSplitter,
+        QToolButton,
         QVBoxLayout,
         QWidget,
         QWidgetAction,
@@ -114,6 +115,14 @@ class ImageAnnotator(QMainWindow):
         self._set_dataset(None, {"images": [], "annotations": [], "categories": []})
 
     def _build_ui(self) -> None:
+        self.user_button = QToolButton()
+        self.user_button.setText("User: —")
+        self.user_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.user_button.setAutoRaise(True)
+        self.user_button.setContentsMargins(8, 0, 28, 0)
+        self.user_button.setToolTip("Change the active user")
+        self.user_button.clicked.connect(self._change_annotator)
+        self.menuBar().setCornerWidget(self.user_button, Qt.Corner.TopRightCorner)
         file_menu = self.menuBar().addMenu("&File")
         self.new_project_action = QAction("New Project…", self)
         self.open_project_action = QAction("Open Project…", self)
@@ -122,8 +131,11 @@ class ImageAnnotator(QMainWindow):
         self.save_project_action = QAction("Save Project", self)
         self.save_project_action.setShortcut(QKeySequence("Ctrl+S"))
         self.save_project_action.setToolTip(
-            "Save the project JSON beside the image folder and include verified images and images with annotation work"
+            "Save the project JSON to its current file, or choose a file if it has not been saved yet"
         )
+        self.save_project_as_action = QAction("Save Project As…", self)
+        self.save_project_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.save_project_as_action.setToolTip("Choose a folder and file name for the project JSON")
         self.training_export_action = QAction("Export Training Dataset…", self)
         self.training_export_action.setToolTip(
             "Export verified images, verified boxes, and explicitly marked background images"
@@ -134,10 +146,12 @@ class ImageAnnotator(QMainWindow):
         self.add_images_action.setEnabled(False)
         self.add_folder_action.setEnabled(False)
         self.save_project_action.setEnabled(False)
+        self.save_project_as_action.setEnabled(False)
         self.training_export_action.setEnabled(False)
         for action in (self.new_project_action, self.open_project_action,
                        self.add_images_action, self.add_folder_action,
-                       self.save_project_action, self.training_export_action,
+                       self.save_project_action, self.save_project_as_action,
+                       self.training_export_action,
                        self.save_image_action,
                        self.save_rois_action):
             file_menu.addAction(action)
@@ -152,19 +166,20 @@ class ImageAnnotator(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
         edit_menu.addSeparator()
-        self.add_class_action = QAction("Add Label…", self)
-        self.rename_class_action = QAction("Rename Label…", self)
-        self.class_color_action = QAction("Label Color…", self)
-        self.import_classes_action = QAction("Import Labels from JSON…", self)
+        self.edit_labels_action = QAction("Edit Categories…", self)
+        self.import_classes_action = QAction("Import Categories from JSON…", self)
+        self.edit_labels_action.setEnabled(False)
         self.import_classes_action.setEnabled(False)
-        for action in (self.add_class_action, self.rename_class_action, self.class_color_action):
-            edit_menu.addAction(action)
+        edit_menu.addAction(self.edit_labels_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.import_classes_action)
-        self.change_annotator_action = QAction("Change Annotator…", self)
+        self.change_annotator_action = QAction("Change User…", self)
         self.change_annotator_action.setEnabled(False)
+        self.edit_annotators_action = QAction("Edit Users…", self)
+        self.edit_annotators_action.setEnabled(False)
         edit_menu.addSeparator()
         edit_menu.addAction(self.change_annotator_action)
+        edit_menu.addAction(self.edit_annotators_action)
 
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -176,9 +191,9 @@ class ImageAnnotator(QMainWindow):
         self.frame_search = QLineEdit()
         self.frame_search.setPlaceholderText("Search filenames…")
         side_layout.addWidget(self.frame_search)
-        side_layout.addWidget(QLabel("Annotator"))
+        side_layout.addWidget(QLabel("User"))
         self.annotator_filter = QComboBox()
-        self.annotator_filter.addItem("All annotators", self.ALL_ANNOTATORS_FILTER_ID)
+        self.annotator_filter.addItem("All users", self.ALL_ANNOTATORS_FILTER_ID)
         self.annotator_filter.currentIndexChanged.connect(self.refresh_frame_list)
         side_layout.addWidget(self.annotator_filter)
         side_layout.addWidget(QLabel("Images"))
@@ -376,7 +391,7 @@ class ImageAnnotator(QMainWindow):
         self.background_check.setEnabled(False)
         annotation_layout.addWidget(self.background_check)
         annotation_layout.addWidget(QLabel("Selected annotation"))
-        annotation_layout.addWidget(QLabel("Label"))
+        annotation_layout.addWidget(QLabel("Category"))
         self.edit_class = QComboBox()
         self.edit_class.setEnabled(False)
         annotation_layout.addWidget(self.edit_class)
@@ -440,11 +455,10 @@ class ImageAnnotator(QMainWindow):
         self.edit_class.currentIndexChanged.connect(self._class_changed)
         self.edit_status.toggled.connect(self._status_changed)
         self.delete_button.clicked.connect(self._delete_selected)
-        self.add_class_action.triggered.connect(self._add_class)
-        self.rename_class_action.triggered.connect(self._rename_class)
-        self.class_color_action.triggered.connect(self._choose_class_color)
+        self.edit_labels_action.triggered.connect(self._edit_labels)
         self.import_classes_action.triggered.connect(self._import_classes)
         self.change_annotator_action.triggered.connect(self._change_annotator)
+        self.edit_annotators_action.triggered.connect(self._edit_annotators)
         select_all.clicked.connect(lambda: self._set_all_classes(True))
         select_none.clicked.connect(lambda: self._set_all_classes(False))
         self.new_project_action.triggered.connect(self.new_project)
@@ -452,6 +466,7 @@ class ImageAnnotator(QMainWindow):
         self.add_images_action.triggered.connect(self.add_images)
         self.add_folder_action.triggered.connect(self.add_folder)
         self.save_project_action.triggered.connect(self.save_project)
+        self.save_project_as_action.triggered.connect(self.save_project_as)
         self.training_export_action.triggered.connect(self.export_training_dataset)
         self.save_image_action.triggered.connect(self.export_frame)
         self.save_rois_action.triggered.connect(self.export_rois)
@@ -480,7 +495,7 @@ class ImageAnnotator(QMainWindow):
         if not isinstance(annotation_data, dict) or not isinstance(annotation_data.get("images", []), list):
             raise ValueError("Project data must be a JSON object with an images array")
         if not isinstance(annotation_data.get("categories", []), list):
-            raise ValueError("Labels must be a JSON array")
+            raise ValueError("Categories must be a JSON array")
         images = annotation_data.get("images", [])
         if any(
             not isinstance(image, dict) or "id" not in image
@@ -494,7 +509,7 @@ class ImageAnnotator(QMainWindow):
         categories = annotation_data.get("categories", [])
         if any(not isinstance(category, dict) or "id" not in category or "name" not in category
                for category in categories):
-            raise ValueError("Each label entry must have an id and name")
+            raise ValueError("Each category entry must have an id and name")
         annotations = annotation_data.get("annotations", [])
         if not isinstance(annotations, list):
             raise ValueError("Annotations must be a JSON array")
@@ -526,9 +541,14 @@ class ImageAnnotator(QMainWindow):
         self.add_images_action.setEnabled(self.root is not None)
         self.add_folder_action.setEnabled(self.root is not None)
         self.save_project_action.setEnabled(self.root is not None)
+        self.save_project_as_action.setEnabled(self.root is not None)
         self.training_export_action.setEnabled(self.root is not None)
-        self.import_classes_action.setEnabled(self.root is not None)
         self.change_annotator_action.setEnabled(self.root is not None)
+        self.change_annotator_action.setText(
+            f"Change User… ({self.current_annotator})"
+            if self.current_annotator else "Choose User…"
+        )
+        self.user_button.setText(f"User: {self.current_annotator or '—'}")
         self.visible_image_ids = visible_image_ids
         self.annotations_path = source_path.resolve() if source_path else None
         if not keep_output:
@@ -552,7 +572,7 @@ class ImageAnnotator(QMainWindow):
         self.annotations_by_image = {image["id"]: [] for image in self.images}
         imported_annotations = source_path is not None
         self.frame_verified_by_image = {
-            image["id"]: is_verified(image.get("frame_verified", True))
+            image["id"]: is_verified(image.get("frame_verified", False))
             if imported_annotations else False
             for image in self.images
         }
@@ -615,7 +635,8 @@ class ImageAnnotator(QMainWindow):
         if not keep_history:
             self._undo_history.clear()
             self._redo_history.clear()
-        self._refresh_annotator_filter(reset=True)
+        # _set_dataset rebuilds the image list itself once every filter is reset.
+        self._refresh_annotator_filter(reset=True, refresh_frames=False)
         self.class_filter.blockSignals(True)
         self._fill_class_filter()
         self.class_filter.blockSignals(False)
@@ -625,8 +646,8 @@ class ImageAnnotator(QMainWindow):
             self.edit_class.addItem(name, category_id)
         if not self.categories:
             self.edit_class.addItem("object", None)
-            self.edit_class.setToolTip("Placeholder only. Add a real label from the Edit menu.")
-            self.draw_button.setToolTip("Add a label from the Edit menu before drawing.")
+            self.edit_class.setToolTip("Placeholder only. Add a category from the Edit menu.")
+            self.draw_button.setToolTip("Add a category from the Edit menu before drawing.")
         else:
             self.edit_class.setToolTip("")
             self.draw_button.setToolTip("")
@@ -641,6 +662,7 @@ class ImageAnnotator(QMainWindow):
         self.frame_verification_filter.setCurrentIndex(0)
         self.frame_verification_filter.blockSignals(False)
         self._sync_frame_controls()
+        self._set_annotation_editing_enabled(self.current_annotator is not None)
         self.setWindowTitle("Stingray Labeler" + (f" — {self.root}" if self.root else ""))
         self.refresh_frame_list(show_progress=True)
         if not self.images:
@@ -685,6 +707,50 @@ class ImageAnnotator(QMainWindow):
             annotation["annotator_id"] = self._annotator_id(self.current_annotator)
             annotation.pop("Annotator", None)
 
+    def _user_names_by_id(self) -> dict[int, str]:
+        return {
+            user["id"]: str(user.get("name", "Unassigned"))
+            for user in self.annotation_data.get("annotators", [])
+            if isinstance(user, dict) and "id" in user
+        }
+
+    def _annotation_user_name(
+        self, annotation: dict[str, Any], names_by_id: dict[int, str] | None = None,
+    ) -> str:
+        legacy_name = annotation.get("Annotator")
+        if isinstance(legacy_name, str) and legacy_name.strip():
+            return legacy_name.strip()
+        try:
+            user_id = int(annotation.get("annotator_id"))
+        except (TypeError, ValueError):
+            return "Unassigned"
+        if names_by_id is None:
+            names_by_id = self._user_names_by_id()
+        return names_by_id.get(user_id, "Unassigned")
+
+    def _editing_allowed(self) -> bool:
+        """Project changes are read-only until a user is chosen."""
+        return self.root is not None and self.current_annotator is not None
+
+    def _set_annotation_editing_enabled(self, enabled: bool) -> None:
+        self.view.setInteractive(enabled)
+        self.undo_action.setEnabled(enabled)
+        self.redo_action.setEnabled(enabled)
+        project_edits = enabled and self.root is not None
+        self.edit_labels_action.setEnabled(project_edits)
+        self.import_classes_action.setEnabled(project_edits)
+        self.edit_annotators_action.setEnabled(project_edits)
+        if not enabled:
+            self.draw_button.setChecked(False)
+            self.view.set_draw_mode(False)
+            self.edit_class.setEnabled(False)
+            self.edit_status.setEnabled(False)
+            self.delete_button.setEnabled(False)
+            self._sync_frame_controls()
+        else:
+            self._selection_changed()
+            self._sync_frame_controls()
+
     def _activate_annotator(self, name: str) -> None:
         existing_names = {
             annotator.get("name")
@@ -693,13 +759,15 @@ class ImageAnnotator(QMainWindow):
         }
         self.current_annotator = name
         self._annotator_id(name)
-        self.change_annotator_action.setText(f"Change Annotator… ({name})")
+        self.user_button.setText(f"User: {name}")
+        self.change_annotator_action.setText(f"Change User… ({name})")
         self._refresh_annotator_filter(reset=True)
+        self._set_annotation_editing_enabled(True)
         if name not in existing_names:
             self.dirty = True
-            self.status_label.setText(f"Unsaved annotator record: {name}")
+            self.status_label.setText(f"Unsaved user record: {name}")
         else:
-            self.status_label.setText(f"Active annotator: {name}")
+            self.status_label.setText(f"Active user: {name}")
 
     def _choose_annotator(
         self, annotation_data: dict[str, Any], *, include_current: bool = False,
@@ -714,26 +782,35 @@ class ImageAnnotator(QMainWindow):
         if include_current and self.current_annotator:
             names.add(self.current_annotator)
         choices = sorted(names, key=str.casefold)
-        if choices:
-            dialog = QInputDialog(self)
-            dialog.setWindowTitle("Select annotator")
-            dialog.setLabelText("Choose an existing annotator or enter a new name:")
-            dialog.setInputMode(QInputDialog.InputMode.ComboBoxInput)
-            dialog.setComboBoxItems(choices)
-            dialog.setComboBoxEditable(True)
-            dialog.setTextValue(self.current_annotator if self.current_annotator in choices else choices[0])
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-            value = dialog.textValue().strip()
-        else:
-            value, accepted = QInputDialog.getText(
-                self, "Create annotator", "Enter your annotator name:"
-            )
-            value = value.strip()
-        if not accepted:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select user")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Choose an existing user or enter a new name:"))
+        name_input = QComboBox(dialog)
+        name_input.setEditable(True)
+        name_input.addItems(choices)
+        if self.current_annotator:
+            name_input.setCurrentText(self.current_annotator)
+        elif choices:
+            name_input.setCurrentIndex(0)
+        layout.addWidget(name_input)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.setMinimumWidth(360)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
+        value = name_input.currentText().strip()
         if not value:
-            QMessageBox.information(self, "Annotator required", "Enter or select an annotator to open this project.")
+            QMessageBox.information(
+                self, "User required", "Enter or select a user name."
+            )
             return None
+        value = next((name for name in choices if name.casefold() == value.casefold()), value)
         return value
 
     def _change_annotator(self) -> None:
@@ -744,13 +821,140 @@ class ImageAnnotator(QMainWindow):
             return
         self._activate_annotator(value)
 
-    def _refresh_annotator_filter(self, *, reset: bool = False) -> None:
+    def _all_annotations(self) -> list[dict[str, Any]]:
+        """Return the live annotation records, including boxes drawn this session."""
+        return [
+            annotation for annotations in self.annotations_by_image.values()
+            for annotation in annotations
+        ]
+
+    def _history_annotations(self) -> list[dict[str, Any]]:
+        """Return annotation records stored in undo/redo snapshots."""
+        return [
+            annotation
+            for _image_id, state in (*self._undo_history, *self._redo_history)
+            for annotation in state
+        ]
+
+    def _users_changed(self, select_filter: str | None = None) -> None:
+        self._mark_dirty(touch_image=False)
+        self.user_button.setText(f"User: {self.current_annotator or '—'}")
+        self.change_annotator_action.setText(
+            f"Change User… ({self.current_annotator})"
+            if self.current_annotator else "Choose User…"
+        )
+        self._refresh_annotation_list(self._selected_item())
+        self._refresh_annotator_filter(select=select_filter)
+
+    def _edit_annotators(self) -> None:
+        if not self._editing_allowed():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit users")
+        layout = QVBoxLayout(dialog)
+        annotator_list = QListWidget(dialog)
+        layout.addWidget(annotator_list)
+
+        def refresh(selected_id: Any = None) -> None:
+            annotator_list.clear()
+            for annotator in sorted(
+                self.annotation_data.get("annotators", []),
+                key=lambda item: str(item.get("name", "")).casefold(),
+            ):
+                item = QListWidgetItem(annotator["name"])
+                item.setData(Qt.ItemDataRole.UserRole, annotator["id"])
+                annotator_list.addItem(item)
+            if selected_id is not None:
+                for row in range(annotator_list.count()):
+                    if annotator_list.item(row).data(Qt.ItemDataRole.UserRole) == selected_id:
+                        annotator_list.setCurrentRow(row)
+                        break
+            if annotator_list.count() and annotator_list.currentRow() < 0:
+                annotator_list.setCurrentRow(0)
+
+        def rename_annotator() -> None:
+            item = annotator_list.currentItem()
+            if item is None:
+                return
+            source_id = item.data(Qt.ItemDataRole.UserRole)
+            source = next(
+                (record for record in self.annotation_data["annotators"]
+                 if record["id"] == source_id),
+                None,
+            )
+            if source is None:
+                return
+            old_name = source["name"]
+            name, accepted = QInputDialog.getText(
+                self, "Rename user", "User name:", text=old_name
+            )
+            name = name.strip()
+            if not accepted or not name or name == old_name:
+                return
+            target = next(
+                (record for record in self.annotation_data["annotators"]
+                 if record["id"] != source_id and record["name"].casefold() == name.casefold()),
+                None,
+            )
+            filtered_on_source = self.annotator_filter.currentData() == old_name
+            if target is not None:
+                self._commit_current_scene()
+
+                def from_source(annotation: dict[str, Any]) -> bool:
+                    return (annotation.get("annotator_id") == source_id
+                            or annotation.get("Annotator") == old_name)
+
+                count = sum(from_source(annotation) for annotation in self._all_annotations())
+                answer = QMessageBox.question(
+                    self,
+                    "Merge users?",
+                    f"Merge {old_name!r} into {target['name']!r}? This will reassign {count:,} ROI(s).",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                for annotation in (*self._all_annotations(), *self._history_annotations()):
+                    if from_source(annotation):
+                        annotation["annotator_id"] = target["id"]
+                        annotation.pop("Annotator", None)
+                self.annotation_data["annotators"].remove(source)
+                if self.current_annotator == old_name:
+                    self.current_annotator = target["name"]
+                self._users_changed(target["name"] if filtered_on_source else None)
+                refresh(target["id"])
+                return
+
+            source["name"] = name
+            for annotation in (*self._all_annotations(), *self._history_annotations()):
+                if annotation.get("Annotator") == old_name:
+                    annotation["Annotator"] = name
+            if self.current_annotator == old_name:
+                self.current_annotator = name
+            self._users_changed(name if filtered_on_source else None)
+            refresh(source_id)
+
+        controls = QHBoxLayout()
+        rename_button = QPushButton("Rename / merge…", dialog)
+        controls.addWidget(rename_button)
+        layout.addLayout(controls)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        rename_button.clicked.connect(rename_annotator)
+        annotator_list.itemDoubleClicked.connect(lambda _item: rename_annotator())
+        refresh()
+        dialog.setMinimumSize(420, 360)
+        dialog.exec()
+
+    def _refresh_annotator_filter(
+        self, *, reset: bool = False, select: str | None = None,
+        refresh_frames: bool = True,
+    ) -> None:
         if not hasattr(self, "annotator_filter"):
             return
-        previous = (
-            self.ALL_ANNOTATORS_FILTER_ID if reset
-            else self.annotator_filter.currentData()
-        )
+        before = self.annotator_filter.currentData()
+        previous = select or (self.ALL_ANNOTATORS_FILTER_ID if reset else before)
         names = {
             value.strip()
             for annotator in self.annotation_data.get("annotators", [])
@@ -762,7 +966,7 @@ class ImageAnnotator(QMainWindow):
             names.add(self.current_annotator)
         self.annotator_filter.blockSignals(True)
         self.annotator_filter.clear()
-        self.annotator_filter.addItem("All annotators", self.ALL_ANNOTATORS_FILTER_ID)
+        self.annotator_filter.addItem("All users", self.ALL_ANNOTATORS_FILTER_ID)
         for name in sorted(names, key=str.casefold):
             self.annotator_filter.addItem(name, name)
         self.annotator_filter.addItem(
@@ -771,6 +975,9 @@ class ImageAnnotator(QMainWindow):
         index = self.annotator_filter.findData(previous)
         self.annotator_filter.setCurrentIndex(index if index >= 0 else 0)
         self.annotator_filter.blockSignals(False)
+        # Signals were blocked above, so rebuild the image list when the active filter moved.
+        if refresh_frames and self.annotator_filter.currentData() != before:
+            self.refresh_frame_list(preserve_scene=True)
 
     def new_project(self) -> None:
         if not self._confirm_dataset_change():
@@ -785,15 +992,19 @@ class ImageAnnotator(QMainWindow):
         if paths is None:
             return
         annotation_data = self._empty_annotation_data()
-        annotator = self._choose_annotator(annotation_data)
-        if annotator is None:
-            return
+        self.current_annotator = None
         self._set_dataset(root, annotation_data)
-        self._activate_annotator(annotator)
         added, duplicates = self._add_source_images(paths, refresh=False)
+        self.refresh_frame_list(show_progress=True)
+        annotator = self._choose_annotator(self.annotation_data)
+        if annotator is None:
+            self.status_label.setText(
+                "Project loaded. Choose a user to enable annotation edits."
+            )
+            return
+        self._activate_annotator(annotator)
         if duplicates:
             self._show_duplicate_summary(duplicates, added)
-        self.refresh_frame_list(show_progress=True)
         self.status_label.setText(
             f"New project: {added:,} candidate image(s) scanned. Save Project packages reviewed work only."
         )
@@ -818,10 +1029,16 @@ class ImageAnnotator(QMainWindow):
         if annotations_file is not None:
             try:
                 annotation_data = self._read_annotation_data(annotations_file)
-                annotator = self._choose_annotator(annotation_data)
-                if annotator is None:
+                if not self._fill_missing_image_verification(annotation_data):
                     return
+                self.current_annotator = None
                 self._set_dataset(root, annotation_data, annotations_file)
+                annotator = self._choose_annotator(self.annotation_data)
+                if annotator is None:
+                    self.status_label.setText(
+                        "Project loaded. Choose a user to enable annotation edits."
+                    )
+                    return
                 self._activate_annotator(annotator)
             except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as error:
                 QMessageBox.critical(self, "Cannot open project", str(error))
@@ -840,15 +1057,19 @@ class ImageAnnotator(QMainWindow):
         if paths is None:
             return
         annotation_data = self._empty_annotation_data()
-        annotator = self._choose_annotator(annotation_data)
-        if annotator is None:
-            return
+        self.current_annotator = None
         self._set_dataset(root, annotation_data)
-        self._activate_annotator(annotator)
         added, duplicates = self._add_source_images(paths, refresh=False)
+        self.refresh_frame_list(show_progress=True)
+        annotator = self._choose_annotator(self.annotation_data)
+        if annotator is None:
+            self.status_label.setText(
+                "Project loaded. Choose a user to enable annotation edits."
+            )
+            return
+        self._activate_annotator(annotator)
         if duplicates:
             self._show_duplicate_summary(duplicates, added)
-        self.refresh_frame_list(show_progress=True)
         self.status_label.setText(
             f"Scanned project: {added:,} candidate image(s). Save Project packages reviewed work only."
         )
@@ -961,9 +1182,37 @@ class ImageAnnotator(QMainWindow):
                 except OSError as error:
                     QMessageBox.critical(self, "Could not save duplicate list", str(error))
 
+    def _fill_missing_image_verification(self, annotation_data: dict[str, Any]) -> bool:
+        """Ask how to treat images saved without a frame_verified value; False cancels opening."""
+        missing = [image for image in annotation_data["images"] if "frame_verified" not in image]
+        if not missing:
+            return True
+        message = QMessageBox(self)
+        message.setWindowTitle("Image verification not recorded")
+        message.setIcon(QMessageBox.Icon.Question)
+        message.setText(
+            f"{len(missing):,} of {len(annotation_data['images']):,} image(s) in this file "
+            "have no image verification status."
+        )
+        message.setInformativeText(
+            "Choose how to treat them. Unverified images are left out of training exports "
+            "until someone marks them verified. Verified images without boxes are treated as background."
+        )
+        unverified_button = message.addButton("Mark unverified", QMessageBox.ButtonRole.AcceptRole)
+        verified_button = message.addButton("Mark verified", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(unverified_button)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked not in (unverified_button, verified_button):
+            return False
+        for image in missing:
+            image["frame_verified"] = clicked is verified_button
+        return True
+
     def _read_annotation_data(self, path: Path) -> dict[str, Any]:
         size = path.stat().st_size
-        progress = QProgressDialog("Reading annotations.json…", "Cancel", 0, max(1, size), self)
+        progress = QProgressDialog(f"Reading {path.name}…", "Cancel", 0, max(1, size), self)
         progress.setWindowTitle("Loading annotations")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
@@ -980,13 +1229,40 @@ class ImageAnnotator(QMainWindow):
                     if progress.wasCanceled():
                         raise ValueError("Loading annotations was cancelled")
             progress.setRange(0, 0)
-            progress.setLabelText("Parsing annotations.json…")
+            progress.setLabelText(f"Parsing {path.name}…")
             QApplication.processEvents()
             annotation_data = json.loads(contents)
         finally:
             progress.close()
         if not isinstance(annotation_data, dict) or not isinstance(annotation_data.get("images"), list):
             raise ValueError("Annotation JSON must contain an images array")
+        for field in ("annotations", "categories"):
+            if field not in annotation_data:
+                annotation_data[field] = []
+            elif not isinstance(annotation_data[field], list):
+                raise ValueError(f"The {field} field must be a JSON array")
+        if annotation_data.get("annotators") is None:
+            annotation_data["annotators"] = []
+        elif not isinstance(annotation_data.get("annotators", []), list):
+            raise ValueError("User metadata must be a JSON array")
+        annotator_ids = set()
+        for annotator in annotation_data["annotators"]:
+            if (
+                not isinstance(annotator, dict)
+                or "id" not in annotator
+                or not isinstance(annotator.get("name"), str)
+            ):
+                raise ValueError("Each user must have an id and a non-empty name")
+            annotator["name"] = annotator["name"].strip()
+            if not annotator["name"]:
+                raise ValueError("Each user must have an id and a non-empty name")
+            try:
+                annotator["id"] = int(annotator["id"])
+            except (TypeError, ValueError):
+                raise ValueError("Each user id must be an integer") from None
+            if annotator["id"] in annotator_ids:
+                raise ValueError("User IDs must be unique")
+            annotator_ids.add(annotator["id"])
         for image in annotation_data["images"]:
             if not isinstance(image, dict) or not isinstance(image.get("file_name"), str):
                 raise ValueError("Each image entry must have a file_name")
@@ -1036,7 +1312,7 @@ class ImageAnnotator(QMainWindow):
         self._redo_history.clear()
 
     def undo(self) -> None:
-        if not self._undo_history:
+        if self.current_annotator is None or not self._undo_history:
             return
         image_id, state = self._undo_history.pop()
         self._redo_history.append(self._snapshot_image_annotations(image_id))
@@ -1045,7 +1321,7 @@ class ImageAnnotator(QMainWindow):
         self.status_label.setText("Undo — unsaved changes")
 
     def redo(self) -> None:
-        if not self._redo_history:
+        if self.current_annotator is None or not self._redo_history:
             return
         image_id, state = self._redo_history.pop()
         self._undo_history.append(self._snapshot_image_annotations(image_id))
@@ -1579,11 +1855,29 @@ class ImageAnnotator(QMainWindow):
             or self.background_by_image.get(image_id, False)
         )
 
+    def _choose_json_save_path(self, title: str, suggested: Path) -> Path | None:
+        """Ask for a JSON file location; the dialog confirms before replacing a file."""
+        dialog = QFileDialog(self, title, str(suggested))
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter("JSON files (*.json)")
+        dialog.setDefaultSuffix("json")
+        dialog.selectFile(suggested.name)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.selectedFiles():
+            return None
+        return Path(dialog.selectedFiles()[0]).resolve()
+
     def save_project(self) -> bool:
+        return self._save_project(self.annotations_path)
+
+    def save_project_as(self) -> bool:
+        return self._save_project(None)
+
+    def _save_project(self, save_path: Path | None) -> bool:
         if self.root is None:
             QMessageBox.information(self, "No project", "Create or open a project folder first.")
             return False
-        if not self.dirty and self.annotations_path is not None:
+        if save_path is not None and not self.dirty:
             return True
         self._commit_current_scene()
         export_images = [
@@ -1593,7 +1887,7 @@ class ImageAnnotator(QMainWindow):
             or image["id"] in self.persisted_image_ids
             or image["id"] in self.touched_image_ids
         ]
-        if not export_images:
+        if not export_images and not self.dirty:
             QMessageBox.information(
                 self, "Nothing to save yet",
                 "No verified images or images with annotation work are ready to save. "
@@ -1611,6 +1905,13 @@ class ImageAnnotator(QMainWindow):
         ):
             QMessageBox.critical(self, "Invalid box", "A box contains non-finite coordinates; nothing was saved.")
             return False
+        if save_path is None:
+            save_path = self._choose_json_save_path(
+                "Save project as",
+                self.annotations_path or self.root.parent / f"{self.root.name}.json",
+            )
+            if save_path is None:
+                return False
 
         if self._project_image_names is None:
             self._project_image_names = directory_names(self.root)
@@ -1667,7 +1968,6 @@ class ImageAnnotator(QMainWindow):
         project_data = dict(self.annotation_data)
         project_data["images"] = exported_images
         project_data["annotations"] = packaged_annotations
-        save_path = self.root.parent / "annotations.json"
         temporary_path = save_path.with_name(save_path.name + ".tmp")
         try:
             temporary_path.write_text(json.dumps(project_data, indent=2) + "\n", encoding="utf-8")
@@ -1722,10 +2022,15 @@ class ImageAnnotator(QMainWindow):
         if not output_folder:
             return
         destination = Path(output_folder).resolve()
-        if "annotations.json" in directory_names(destination.parent):
+        save_path = self._choose_json_save_path(
+            "Save training annotations as", destination.parent / f"{destination.name}.json"
+        )
+        if save_path is None:
+            return
+        if self.annotations_path is not None and path_key(save_path) == path_key(self.annotations_path):
             QMessageBox.warning(
-                self, "Destination already contains annotations.json",
-                "Choose an empty output folder so the training export does not replace another dataset.",
+                self, "Choose another file",
+                "The training export cannot replace the open project's JSON file.",
             )
             return
 
@@ -1754,7 +2059,10 @@ class ImageAnnotator(QMainWindow):
                 QMessageBox.critical(self, "Training export failed", str(error))
                 return
             record = dict(image)
-            record["file_name"] = (Path(destination.name) / name).as_posix()
+            try:
+                record["file_name"] = Path(os.path.relpath(target, save_path.parent)).as_posix()
+            except ValueError:  # Different Windows drives have no relative path.
+                record["file_name"] = target.as_posix()
             record["frame_verified"] = True
             record["background"] = self.background_by_image.get(image["id"], False)
             exported_images.append(record)
@@ -1781,7 +2089,6 @@ class ImageAnnotator(QMainWindow):
         info = dict(source_info) if isinstance(source_info, dict) else {}
         export_data["info"] = info
         info["description"] = "Verified training subset exported from Stingray Label"
-        save_path = destination.parent / "annotations.json"
         temporary_path = save_path.with_name(save_path.name + ".tmp")
         try:
             temporary_path.write_text(
@@ -2057,9 +2364,9 @@ class ImageAnnotator(QMainWindow):
             self.roi_totals[status_index] += 1
         self.roi_counts_by_image[image_id] = updated
 
-    def _mark_dirty(self, *, counts_changed: bool = False) -> None:
+    def _mark_dirty(self, *, counts_changed: bool = False, touch_image: bool = True) -> None:
         self.dirty = True
-        if self.current_image_id is not None:
+        if touch_image and self.current_image_id is not None:
             self.touched_image_ids.add(self.current_image_id)
         self.status_label.setText("Unsaved annotation edits")
         if counts_changed:
@@ -2081,20 +2388,24 @@ class ImageAnnotator(QMainWindow):
         image_id = self.current_image_id
         active = image_id in self.image_by_id
         has_rois = bool(self.current_items) if active else False
+        can_edit = active and self.current_annotator is not None
         self.frame_verified_check.blockSignals(True)
         self.frame_verified_check.setChecked(
             self.frame_verified_by_image.get(image_id, False) if active else False
         )
-        self.frame_verified_check.setEnabled(active)
+        self.frame_verified_check.setEnabled(can_edit)
         self.frame_verified_check.blockSignals(False)
         self.background_check.blockSignals(True)
         self.background_check.setChecked(
             self.background_by_image.get(image_id, False) if active else False
         )
         self.background_check.setVisible(True)
-        self.background_check.setEnabled(active and not has_rois)
+        self.background_check.setEnabled(can_edit and not has_rois)
         self.background_check.blockSignals(False)
-        can_draw = active and bool(self.categories) and not self.background_by_image.get(image_id, False)
+        can_draw = (
+            can_edit and bool(self.categories)
+            and not self.background_by_image.get(image_id, False)
+        )
         self.draw_button.setEnabled(can_draw)
         if not can_draw and self.draw_button.isChecked():
             self.draw_button.setChecked(False)
@@ -2102,6 +2413,9 @@ class ImageAnnotator(QMainWindow):
     def _frame_verified_changed(self, checked: bool) -> None:
         image_id = self.current_image_id
         if image_id not in self.image_by_id:
+            return
+        if self.current_annotator is None:
+            self._sync_frame_controls()
             return
         if self.frame_verified_by_image.get(image_id, False) == checked:
             return
@@ -2115,6 +2429,9 @@ class ImageAnnotator(QMainWindow):
         image_id = self.current_image_id
         if image_id not in self.image_by_id or self.current_items:
             return
+        if self.current_annotator is None:
+            self._sync_frame_controls()
+            return
         if self.background_by_image.get(image_id, False) == checked:
             return
         self.background_by_image[image_id] = checked
@@ -2127,7 +2444,7 @@ class ImageAnnotator(QMainWindow):
         self.refresh_frame_list(preserve_scene=True)
 
     def _set_draw_mode(self, enabled: bool) -> None:
-        if enabled and (self.current_image_id is None
+        if enabled and (self.current_annotator is None or self.current_image_id is None
                         or self.background_by_image.get(self.current_image_id, False)):
             self.draw_button.setChecked(False)
             return
@@ -2135,7 +2452,7 @@ class ImageAnnotator(QMainWindow):
         self.draw_button.setText("Cancel drawing" if enabled else "Draw box")
 
     def _add_rectangle(self, rect: QRectF) -> None:
-        if self.current_image_id is None:
+        if self.current_annotator is None or self.current_image_id is None:
             return
         self.draw_button.setChecked(False)
         image = self.image_by_id[self.current_image_id]
@@ -2151,7 +2468,7 @@ class ImageAnnotator(QMainWindow):
             return
         current_name = self.categories.get(self.edit_class.currentData(), names[0])
         name, accepted = QInputDialog.getItem(
-            self, "Choose label", "Select an existing label:",
+            self, "Choose category", "Select an existing category:",
             names, names.index(current_name) if current_name in names else 0, False,
         )
         if not accepted or not name:
@@ -2171,7 +2488,7 @@ class ImageAnnotator(QMainWindow):
             "area": (right - left) * (bottom - top),
             "iscrowd": 0,
             "verified": False,
-            "Annotator": self.current_annotator,
+            "annotator_id": self._annotator_id(self.current_annotator),
         }
         self.next_annotation_id += 1
         item = BoxItem(annotation, self.categories[category_id], self._annotation_changed, self._push_undo)
@@ -2194,8 +2511,8 @@ class ImageAnnotator(QMainWindow):
         self._refresh_annotation_list(item)
         self.edit_class.blockSignals(True)
         self.edit_status.blockSignals(True)
-        enabled = item is not None
-        self.edit_class.setEnabled(enabled)
+        enabled = item is not None and self.current_annotator is not None
+        self.edit_class.setEnabled(enabled and bool(self.categories))
         self.edit_status.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
         if item:
@@ -2215,10 +2532,12 @@ class ImageAnnotator(QMainWindow):
         self.annotation_list.blockSignals(True)
         self.annotation_list.clear()
         selected_row = -1
+        names_by_id = self._user_names_by_id()
         for row, item in enumerate(self.current_items):
             status = "verified" if is_verified(item.annotation.get("verified", True)) else "unverified"
-            label = f"{item.category_name} · {status} · #{item.annotation.get('id', '')}"
-            list_item = QListWidgetItem(label)
+            user_name = self._annotation_user_name(item.annotation, names_by_id)
+            text = f"{item.category_name} · {status} · User: {user_name}"
+            list_item = QListWidgetItem(text)
             color_swatch = QPixmap(12, 12)
             color_swatch.fill(item.color())
             list_item.setIcon(QIcon(color_swatch))
@@ -2237,6 +2556,8 @@ class ImageAnnotator(QMainWindow):
         self.view.ensureVisible(item)
 
     def _class_changed(self, index: int) -> None:
+        if self.current_annotator is None:
+            return
         item = self._selected_item()
         category_id = self.edit_class.itemData(index)
         if item is None or category_id not in self.categories:
@@ -2251,6 +2572,8 @@ class ImageAnnotator(QMainWindow):
         self._annotation_changed(item.annotation, counts_changed=True)
 
     def _status_changed(self, checked: bool) -> None:
+        if self.current_annotator is None:
+            return
         item = self._selected_item()
         if item is None:
             return
@@ -2263,23 +2586,93 @@ class ImageAnnotator(QMainWindow):
         self._annotation_changed(item.annotation, counts_changed=True)
 
     def _add_class(self) -> None:
-        name, accepted = QInputDialog.getText(self, "Add label", "New label name:")
+        if not self._editing_allowed():
+            return
+        name, accepted = QInputDialog.getText(self, "Add category", "New category name:")
         name = name.strip()
         if not accepted or not name:
             return
         if any(existing.casefold() == name.casefold() for existing in self.categories.values()):
-            QMessageBox.information(self, "Label already exists", f"The label {name!r} is already available.")
+            QMessageBox.information(self, "Category already exists", f"The category {name!r} is already available.")
             return
         self._create_class(name)
-        self._mark_dirty()
-        self.refresh_frame_list()
+        self._mark_dirty(touch_image=False)
+
+    def _edit_labels(self) -> None:
+        if not self._editing_allowed():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit categories")
+        layout = QVBoxLayout(dialog)
+        label_list = QListWidget(dialog)
+        layout.addWidget(label_list)
+
+        def refresh(selected_id: Any = None) -> None:
+            label_list.clear()
+            for category_id, name in sorted(
+                self.categories.items(), key=lambda pair: pair[1].casefold()
+            ):
+                item = QListWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, category_id)
+                label_list.addItem(item)
+            if selected_id is not None:
+                for row in range(label_list.count()):
+                    if label_list.item(row).data(Qt.ItemDataRole.UserRole) == selected_id:
+                        label_list.setCurrentRow(row)
+                        break
+            if label_list.count() and label_list.currentRow() < 0:
+                label_list.setCurrentRow(0)
+
+        def selected_id() -> Any:
+            item = label_list.currentItem()
+            return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+        controls = QHBoxLayout()
+        add_button = QPushButton("Add category…", dialog)
+        rename_button = QPushButton("Rename / merge…", dialog)
+        color_button = QPushButton("Color…", dialog)
+        controls.addWidget(add_button)
+        controls.addWidget(rename_button)
+        controls.addWidget(color_button)
+        layout.addLayout(controls)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def add_label() -> None:
+            existing_ids = set(self.categories)
+            self._add_class()
+            created_id = next(
+                (category_id for category_id in self.categories if category_id not in existing_ids),
+                None,
+            )
+            refresh(created_id)
+
+        def rename_label() -> None:
+            category_id = selected_id()
+            if category_id is not None:
+                self._rename_class_id(category_id)
+                refresh(category_id if category_id in self.categories else None)
+
+        def color_label() -> None:
+            category_id = selected_id()
+            if category_id is not None:
+                self._choose_class_color(category_id)
+
+        add_button.clicked.connect(add_label)
+        rename_button.clicked.connect(rename_label)
+        color_button.clicked.connect(color_label)
+        label_list.itemDoubleClicked.connect(lambda _item: rename_label())
+        refresh()
+        dialog.setMinimumSize(480, 420)
+        dialog.exec()
 
     def _import_classes(self) -> None:
-        if self.root is None:
+        if not self._editing_allowed():
             return
         start_path = self.annotations_path or self.root
         json_path, _ = QFileDialog.getOpenFileName(
-            self, "Import labels from annotation JSON", str(start_path), "JSON files (*.json)"
+            self, "Import categories from annotation JSON", str(start_path), "JSON files (*.json)"
         )
         if not json_path:
             return
@@ -2290,13 +2683,13 @@ class ImageAnnotator(QMainWindow):
             names = []
             for category in annotation_data["categories"]:
                 if not isinstance(category, dict) or not isinstance(category.get("name"), str):
-                    raise ValueError("Every label must have a name.")
+                    raise ValueError("Every category must have a name.")
                 name = category["name"].strip()
                 if not name:
-                    raise ValueError("Label names cannot be empty.")
+                    raise ValueError("Category names cannot be empty.")
                 names.append(name)
         except (OSError, json.JSONDecodeError, ValueError) as error:
-            QMessageBox.critical(self, "Cannot import labels", str(error))
+            QMessageBox.critical(self, "Cannot import categories", str(error))
             return
 
         existing = {name.casefold() for name in self.categories.values()}
@@ -2309,13 +2702,12 @@ class ImageAnnotator(QMainWindow):
             existing.add(key)
             added.append(name)
         if added:
-            self._mark_dirty()
-            self.refresh_frame_list()
+            self._mark_dirty(touch_image=False)
             QMessageBox.information(
-                self, "Labels imported", f"Imported {len(added):,} label(s):\n" + ", ".join(added)
+                self, "Categories imported", f"Imported {len(added):,} categories:\n" + ", ".join(added)
             )
         else:
-            QMessageBox.information(self, "Labels imported", "All labels already exist in this project.")
+            QMessageBox.information(self, "Categories imported", "All categories already exist in this project.")
 
     def _create_class(self, name: str) -> Any:
         numeric_ids = []
@@ -2340,20 +2732,12 @@ class ImageAnnotator(QMainWindow):
         self.class_filter.addItem(filter_item)
         return category_id
 
-    def _rename_class(self) -> None:
-        names = sorted(self.categories.values(), key=str.casefold)
-        if not names:
+    def _rename_class_id(self, category_id: Any) -> None:
+        old_name = self.categories.get(category_id)
+        if old_name is None:
             return
-        old_name, accepted = QInputDialog.getItem(
-            self, "Rename label", "Select the label to rename:", names, 0, False
-        )
-        if not accepted or not old_name:
-            return
-        category_id = next(
-            key for key, existing in self.categories.items() if existing == old_name
-        )
         name, accepted = QInputDialog.getText(
-            self, "Rename label", "Label name:", text=old_name
+            self, "Rename category", "Category name:", text=old_name
         )
         name = name.strip()
         if not accepted or not name or name == old_name:
@@ -2374,8 +2758,8 @@ class ImageAnnotator(QMainWindow):
             )
             answer = QMessageBox.question(
                 self,
-                "Merge labels?",
-                f"The label {name!r} already exists. Merge {old_name!r} into {name!r}?\n\n"
+                "Merge categories?",
+                f"The category {name!r} already exists. Merge {old_name!r} into {name!r}?\n\n"
                 f"This will move {count:,} annotation boxes to {name!r} and remove {old_name!r} from this dataset.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -2402,7 +2786,7 @@ class ImageAnnotator(QMainWindow):
                 filter_item.setText(name)
                 break
         self._refresh_annotation_list(self._selected_item())
-        self._mark_dirty()
+        self._mark_dirty(touch_image=False)
 
     def _merge_classes(self, source_id: Any, target_id: Any) -> None:
         self._commit_current_scene()
@@ -2414,6 +2798,10 @@ class ImageAnnotator(QMainWindow):
                     annotation["category_id"] = target_id
                     if self.current_annotator:
                         self._set_annotation_annotator(annotation)
+        # Undo must not restore boxes that point at the removed category.
+        for annotation in self._history_annotations():
+            if annotation.get("category_id") == source_id:
+                annotation["category_id"] = target_id
         self.annotation_data["annotations"] = [
             annotation for image in self.images
             for annotation in self.annotations_by_image[image["id"]]
@@ -2440,25 +2828,17 @@ class ImageAnnotator(QMainWindow):
         for image_id, annotations in self.annotations_by_image.items():
             self._set_image_roi_counts(image_id, annotations)
         self._selection_changed()
-        self._mark_dirty(counts_changed=True)
+        self._mark_dirty(counts_changed=True, touch_image=False)
         self._refresh_annotator_filter()
         self.refresh_frame_list(preserve_scene=True)
         self.status_label.setText(
-            f"Merged label {source_name!r} into {target_name!r} — unsaved changes"
+            f"Merged category {source_name!r} into {target_name!r} — unsaved changes"
         )
 
-    def _choose_class_color(self) -> None:
-        names = sorted(self.categories.values(), key=str.casefold)
-        if not names:
+    def _choose_class_color(self, category_id: Any) -> None:
+        if category_id not in self.categories:
             return
-        name, accepted = QInputDialog.getItem(
-            self, "Label color", "Select a label:", names, 0, False
-        )
-        if not accepted or not name:
-            return
-        category_id = next(
-            key for key, existing in self.categories.items() if existing == name
-        )
+        name = self.categories[category_id]
         current_color = BoxItem.class_colors.get(
             category_id,
             QColor.fromHsv((int(category_id) * 137) % 360, 210, 235),
@@ -2502,6 +2882,8 @@ class ImageAnnotator(QMainWindow):
         self._update_rulers()
 
     def _delete_selected(self) -> None:
+        if self.current_annotator is None:
+            return
         item = self._selected_item()
         if item is None:
             return

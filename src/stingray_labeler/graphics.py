@@ -188,6 +188,18 @@ class BoxItem(QGraphicsRectItem):
         return [rect.left(), rect.top(), rect.width(), rect.height()]
 
 
+class ClippedRubberBandItem(QGraphicsRectItem):
+    """Draw the in-progress box without painting beyond the image scene rect."""
+
+    def paint(self, painter, option, widget=None) -> None:  # noqa: N802
+        painter.save()
+        scene = self.scene()
+        if scene is not None:
+            painter.setClipRect(scene.sceneRect(), Qt.ClipOperation.IntersectClip)
+        super().paint(painter, option, widget)
+        painter.restore()
+
+
 class ScaleBarItem(QGraphicsItem):
     """Draw a scale bar over the image in source-pixel coordinates."""
 
@@ -388,6 +400,14 @@ class AnnotationView(QGraphicsView):
         self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
         self.calibrationModeChanged.emit(enabled)
 
+    def _create_rubber_band(self, rect: QRectF) -> QGraphicsRectItem:
+        rubber_band = ClippedRubberBandItem(
+            rect, QPen(self.draw_color, 2.0, Qt.PenStyle.DashLine)
+        )
+        rubber_band.setZValue(20)
+        self.scene().addItem(rubber_band)
+        return rubber_band
+
     def _clear_calibration_line(self) -> None:
         if self._calibration_line is not None and self._calibration_line.scene() is self.scene():
             self.scene().removeItem(self._calibration_line)
@@ -492,11 +512,10 @@ class AnnotationView(QGraphicsView):
             return
         if self.draw_mode and event.button() == Qt.MouseButton.LeftButton:
             self._draw_start = self.mapToScene(event.position().toPoint())
-            self._rubber_band = self.scene().addRect(
-                QRectF(self._draw_start, self._draw_start),
-                QPen(self.draw_color, 2.0, Qt.PenStyle.DashLine),
+            initial_rect = QRectF(self._draw_start, self._draw_start).intersected(
+                self.scene().sceneRect()
             )
-            self._rubber_band.setZValue(20)
+            self._rubber_band = self._create_rubber_band(initial_rect)
             event.accept()
             return
         super().mousePressEvent(event)
