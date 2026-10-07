@@ -9,11 +9,12 @@ import re
 import shutil
 import sys
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 try:
-    from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QRunnable, QThreadPool, QTimer, Signal
+    from PySide6.QtCore import QEvent, QEventLoop, QObject, QPoint, QPointF, QRectF, QSize, Qt, QRunnable, QThreadPool, QTimer, Signal
     from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -59,7 +60,16 @@ from .dataset import is_verified, dataset_image_path, directory_names, path_key
 from .graphics import (
     AnnotationView, BoxItem, ImageRuler, ScaleBarItem, format_length, scale_bar_lengths_mm,
 )
-from .image_processing import AutoLevelsWorker, ImageAdjustmentWorker, apply_image_adjustments
+from .image_processing import (
+    Adjustments, AutoLevelsWorker, DetailWorker, ImageLoadWorker, LoadedImage, PipelineSignals,
+    PreviewAdjustmentWorker, apply_image_adjustments,
+)
+
+IMAGE_CACHE_SIZE = 3  # current image plus the previous and next ones
+
+
+class OperationCancelled(Exception):
+    """Raised inside a background task when the user presses Cancel."""
 
 
 class ImageAnnotator(QMainWindow):
@@ -96,13 +106,30 @@ class ImageAnnotator(QMainWindow):
         self.base_image: Image.Image | None = None
         self.background_item: QGraphicsPixmapItem | None = None
         self.scale_bar_item: ScaleBarItem | None = None
+        self.detail_item: QGraphicsPixmapItem | None = None
+        self._loaded: LoadedImage | None = None
+        self._image_cache: OrderedDict[Any, LoadedImage] = OrderedDict()
+        self._pending_image_id: Any = None
+        self._dataset_generation = 0
+        self._load_workers: dict[Any, ImageLoadWorker] = {}
         self._adjust_generation = 0
         self._adjust_cancel: threading.Event | None = None
-        self._adjust_workers: dict[int, ImageAdjustmentWorker] = {}
+        self._adjust_workers: dict[int, PreviewAdjustmentWorker] = {}
         self._auto_level_workers: dict[int, AutoLevelsWorker] = {}
         self._auto_level_generation = 0
+        self._detail_generation = 0
+        self._detail_workers: dict[int, DetailWorker] = {}
         self.adjustment_pool = QThreadPool(self)
         self.adjustment_pool.setMaxThreadCount(2)
+        self.image_pool = QThreadPool(self)
+        self.image_pool.setMaxThreadCount(2)
+        self.pipeline_signals = PipelineSignals(self)
+        self._frame_items: dict[Any, QListWidgetItem] = {}
+        self._frame_names: dict[Any, str] = {}
+        self._shown_ids: set[Any] = set()
+        self._user_name_by_id: dict[int, str] = {}
+        self._user_id_by_name: dict[str, int] = {}
+        self._load_notes: list[str] = []
         self.dirty = False
         self._refreshing = False
         self._undo_history: list[tuple[Any, list[dict[str, Any]]]] = []
@@ -112,6 +139,12 @@ class ImageAnnotator(QMainWindow):
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "stingray_label_icon.png")))
         self.resize(1400, 900)
         self._build_ui()
+        signals = self.pipeline_signals
+        signals.image_loaded.connect(self._image_loaded)
+        signals.image_failed.connect(self._image_failed)
+        signals.preview_adjusted.connect(self._adjustment_finished)
+        signals.detail_ready.connect(self._detail_finished)
+        signals.levels_ready.connect(self._auto_levels_finished)
         self._set_dataset(None, {"images": [], "annotations": [], "categories": []})
 
     def _build_ui(self) -> None:
@@ -194,7 +227,7 @@ class ImageAnnotator(QMainWindow):
         side_layout.addWidget(QLabel("User"))
         self.annotator_filter = QComboBox()
         self.annotator_filter.addItem("All users", self.ALL_ANNOTATORS_FILTER_ID)
-        self.annotator_filter.currentIndexChanged.connect(self.refresh_frame_list)
+        self.annotator_filter.currentIndexChanged.connect(self._apply_frame_filters)
         side_layout.addWidget(self.annotator_filter)
         side_layout.addWidget(QLabel("Images"))
         self.frame_list = QListWidget()
@@ -420,10 +453,19 @@ class ImageAnnotator(QMainWindow):
         layout.addWidget(splitter)
         self.setCentralWidget(container)
 
-        self.class_filter.itemChanged.connect(self.refresh_frame_list)
-        self.frame_verification_filter.currentIndexChanged.connect(self.refresh_frame_list)
-        self.verification_filter.currentIndexChanged.connect(self.refresh_frame_list)
-        self.frame_search.textChanged.connect(self.refresh_frame_list)
+        self.class_filter.itemChanged.connect(self._apply_frame_filters)
+        self.frame_verification_filter.currentIndexChanged.connect(self._apply_frame_filters)
+        self.verification_filter.currentIndexChanged.connect(self._apply_frame_filters)
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(150)
+        self.search_timer.timeout.connect(self._apply_frame_filters)
+        # Lambdas: a signal's argument would otherwise become QTimer.start(msec).
+        self.frame_search.textChanged.connect(lambda _text: self.search_timer.start())
+        self.detail_timer = QTimer(self)
+        self.detail_timer.setSingleShot(True)
+        self.detail_timer.setInterval(120)
+        self.detail_timer.timeout.connect(self._update_detail)
         self.frame_list.currentItemChanged.connect(self._frame_selection_changed)
         self.previous_button.clicked.connect(lambda: self._navigate_frames(-1))
         self.next_button.clicked.connect(lambda: self._navigate_frames(1))
@@ -450,6 +492,9 @@ class ImageAnnotator(QMainWindow):
         self.view.viewChanged.connect(self._update_rulers)
         self.view.horizontalScrollBar().valueChanged.connect(self._update_rulers)
         self.view.verticalScrollBar().valueChanged.connect(self._update_rulers)
+        self.view.viewChanged.connect(lambda: self.detail_timer.start())
+        self.view.horizontalScrollBar().valueChanged.connect(lambda _value: self.detail_timer.start())
+        self.view.verticalScrollBar().valueChanged.connect(lambda _value: self.detail_timer.start())
         self.scene.selectionChanged.connect(self._selection_changed)
         self.annotation_list.currentRowChanged.connect(self._annotation_row_changed)
         self.edit_class.currentIndexChanged.connect(self._class_changed)
@@ -520,13 +565,20 @@ class ImageAnnotator(QMainWindow):
         self.view.clear_drawing_guides()
         self.draw_button.setChecked(False)
         self._cancel_image_adjustment()
+        self._detail_generation += 1
         self.scene.clear()
         self.scene.setSceneRect(QRectF())
         self.current_items = []
         self.base_image = None
         self.background_item = None
+        self.detail_item = None
         self.scale_bar_item = None
         self.current_image_id = None
+        self._loaded = None
+        self._pending_image_id = None
+        self._image_cache.clear()
+        self._load_workers.clear()
+        self._dataset_generation += 1
         self.root = root.resolve() if root else None
         BoxItem.class_colors.clear()
         self._project_image_names = None
@@ -560,6 +612,7 @@ class ImageAnnotator(QMainWindow):
             for category in self.annotation_data.setdefault("categories", [])
         }
         self.image_by_id = {image["id"]: image for image in self.images}
+        self._rebuild_user_cache()
         self.source_paths_by_image = {}
         if self.root is not None:
             for image in self.images:
@@ -635,7 +688,7 @@ class ImageAnnotator(QMainWindow):
         if not keep_history:
             self._undo_history.clear()
             self._redo_history.clear()
-        # _set_dataset rebuilds the image list itself once every filter is reset.
+        # _set_dataset builds the image list itself once every filter is reset.
         self._refresh_annotator_filter(reset=True, refresh_frames=False)
         self.class_filter.blockSignals(True)
         self._fill_class_filter()
@@ -654,7 +707,9 @@ class ImageAnnotator(QMainWindow):
         self.edit_class.setEnabled(bool(self.categories))
         self.draw_button.setEnabled(bool(self.categories))
         self.edit_class.blockSignals(False)
+        self.frame_search.blockSignals(True)
         self.frame_search.clear()
+        self.frame_search.blockSignals(False)
         self.verification_filter.blockSignals(True)
         self.verification_filter.setCurrentIndex(0)
         self.verification_filter.blockSignals(False)
@@ -664,9 +719,7 @@ class ImageAnnotator(QMainWindow):
         self._sync_frame_controls()
         self._set_annotation_editing_enabled(self.current_annotator is not None)
         self.setWindowTitle("Stingray Labeler" + (f" — {self.root}" if self.root else ""))
-        self.refresh_frame_list(show_progress=True)
-        if not self.images:
-            self._update_frame_stats()
+        self._rebuild_frame_list(show_progress=True)
 
     def _confirm_dataset_change(self) -> bool:
         if not self.dirty:
@@ -690,33 +743,32 @@ class ImageAnnotator(QMainWindow):
             "annotators": [],
         }
 
+    def _rebuild_user_cache(self) -> None:
+        """Refresh the id <-> name lookups; only needed when users are loaded, added, renamed or merged."""
+        self._user_name_by_id = {
+            int(user["id"]): str(user.get("name", ""))
+            for user in self.annotation_data.get("annotators", [])
+            if isinstance(user, dict) and "id" in user
+        }
+        self._user_id_by_name = {name: user_id for user_id, name in self._user_name_by_id.items()}
+
     def _annotator_id(self, name: str) -> int:
-        annotators = self.annotation_data.setdefault("annotators", [])
-        for annotator in annotators:
-            if isinstance(annotator, dict) and annotator.get("name") == name:
-                return int(annotator["id"])
-        next_id = max(
-            (int(annotator.get("id", 0)) for annotator in annotators if isinstance(annotator, dict)),
-            default=0,
-        ) + 1
-        annotators.append({"id": next_id, "name": name})
-        return next_id
+        user_id = self._user_id_by_name.get(name)
+        if user_id is not None:
+            return user_id
+        user_id = max(self._user_name_by_id, default=0) + 1
+        self.annotation_data.setdefault("annotators", []).append({"id": user_id, "name": name})
+        self._user_name_by_id[user_id] = name
+        self._user_id_by_name[name] = user_id
+        self._refresh_annotator_filter()  # a new user is the only reason to touch the dropdown
+        return user_id
 
     def _set_annotation_annotator(self, annotation: dict[str, Any]) -> None:
         if self.current_annotator:
             annotation["annotator_id"] = self._annotator_id(self.current_annotator)
             annotation.pop("Annotator", None)
 
-    def _user_names_by_id(self) -> dict[int, str]:
-        return {
-            user["id"]: str(user.get("name", "Unassigned"))
-            for user in self.annotation_data.get("annotators", [])
-            if isinstance(user, dict) and "id" in user
-        }
-
-    def _annotation_user_name(
-        self, annotation: dict[str, Any], names_by_id: dict[int, str] | None = None,
-    ) -> str:
+    def _annotation_user_name(self, annotation: dict[str, Any]) -> str:
         legacy_name = annotation.get("Annotator")
         if isinstance(legacy_name, str) and legacy_name.strip():
             return legacy_name.strip()
@@ -724,9 +776,7 @@ class ImageAnnotator(QMainWindow):
             user_id = int(annotation.get("annotator_id"))
         except (TypeError, ValueError):
             return "Unassigned"
-        if names_by_id is None:
-            names_by_id = self._user_names_by_id()
-        return names_by_id.get(user_id, "Unassigned")
+        return self._user_name_by_id.get(user_id, "Unassigned")
 
     def _editing_allowed(self) -> bool:
         """Project changes are read-only until a user is chosen."""
@@ -752,18 +802,13 @@ class ImageAnnotator(QMainWindow):
             self._sync_frame_controls()
 
     def _activate_annotator(self, name: str) -> None:
-        existing_names = {
-            annotator.get("name")
-            for annotator in self.annotation_data.get("annotators", [])
-            if isinstance(annotator, dict)
-        }
+        is_new = name not in self._user_id_by_name
         self.current_annotator = name
         self._annotator_id(name)
         self.user_button.setText(f"User: {name}")
         self.change_annotator_action.setText(f"Change User… ({name})")
-        self._refresh_annotator_filter(reset=True)
         self._set_annotation_editing_enabled(True)
-        if name not in existing_names:
+        if is_new:
             self.dirty = True
             self.status_label.setText(f"Unsaved user record: {name}")
         else:
@@ -843,8 +888,11 @@ class ImageAnnotator(QMainWindow):
             f"Change User… ({self.current_annotator})"
             if self.current_annotator else "Choose User…"
         )
+        self._rebuild_user_cache()
         self._refresh_annotation_list(self._selected_item())
-        self._refresh_annotator_filter(select=select_filter)
+        self._refresh_annotator_filter(select=select_filter, refresh_frames=False)
+        # Boxes changed owner, so re-check rows against the active user filter.
+        self._apply_frame_filters(select_first=False)
 
     def _edit_annotators(self) -> None:
         if not self._editing_allowed():
@@ -955,13 +1003,7 @@ class ImageAnnotator(QMainWindow):
             return
         before = self.annotator_filter.currentData()
         previous = select or (self.ALL_ANNOTATORS_FILTER_ID if reset else before)
-        names = {
-            value.strip()
-            for annotator in self.annotation_data.get("annotators", [])
-            if isinstance(annotator, dict)
-            and isinstance((value := annotator.get("name")), str)
-            and value.strip()
-        }
+        names = {name.strip() for name in self._user_id_by_name if name.strip()}
         if self.current_annotator:
             names.add(self.current_annotator)
         self.annotator_filter.blockSignals(True)
@@ -975,9 +1017,9 @@ class ImageAnnotator(QMainWindow):
         index = self.annotator_filter.findData(previous)
         self.annotator_filter.setCurrentIndex(index if index >= 0 else 0)
         self.annotator_filter.blockSignals(False)
-        # Signals were blocked above, so rebuild the image list when the active filter moved.
+        # Signals were blocked above, so re-check rows when the active filter moved.
         if refresh_frames and self.annotator_filter.currentData() != before:
-            self.refresh_frame_list(preserve_scene=True)
+            self._apply_frame_filters(select_first=False)
 
     def new_project(self) -> None:
         if not self._confirm_dataset_change():
@@ -995,7 +1037,7 @@ class ImageAnnotator(QMainWindow):
         self.current_annotator = None
         self._set_dataset(root, annotation_data)
         added, duplicates = self._add_source_images(paths, refresh=False)
-        self.refresh_frame_list(show_progress=True)
+        self._rebuild_frame_list(show_progress=True)
         annotator = self._choose_annotator(self.annotation_data)
         if annotator is None:
             self.status_label.setText(
@@ -1034,12 +1076,16 @@ class ImageAnnotator(QMainWindow):
                 self.current_annotator = None
                 self._set_dataset(root, annotation_data, annotations_file)
                 annotator = self._choose_annotator(self.annotation_data)
+                loaded_notes = "; ".join(self._load_notes)
                 if annotator is None:
                     self.status_label.setText(
                         "Project loaded. Choose a user to enable annotation edits."
+                        + (f"\nOn load: {loaded_notes}." if loaded_notes else "")
                     )
                     return
                 self._activate_annotator(annotator)
+                if loaded_notes:
+                    self.status_label.setText(f"On load: {loaded_notes}.")
             except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as error:
                 QMessageBox.critical(self, "Cannot open project", str(error))
             return
@@ -1060,7 +1106,7 @@ class ImageAnnotator(QMainWindow):
         self.current_annotator = None
         self._set_dataset(root, annotation_data)
         added, duplicates = self._add_source_images(paths, refresh=False)
-        self.refresh_frame_list(show_progress=True)
+        self._rebuild_frame_list(show_progress=True)
         annotator = self._choose_annotator(self.annotation_data)
         if annotator is None:
             self.status_label.setText(
@@ -1148,7 +1194,7 @@ class ImageAnnotator(QMainWindow):
             added += 1
         if added:
             if refresh:
-                self.refresh_frame_list(show_progress=True)
+                self._rebuild_frame_list(show_progress=True)
         if added:
             self.status_label.setText(f"Added {added:,} image(s). Source files remain in place until Save Project.")
         return added, duplicates
@@ -1212,28 +1258,25 @@ class ImageAnnotator(QMainWindow):
 
     def _read_annotation_data(self, path: Path) -> dict[str, Any]:
         size = path.stat().st_size
-        progress = QProgressDialog(f"Reading {path.name}…", "Cancel", 0, max(1, size), self)
-        progress.setWindowTitle("Loading annotations")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-        progress.raise_()
-        QApplication.processEvents()
-        contents = bytearray()
-        try:
+
+        def read(report, cancelled: threading.Event) -> Any:
+            contents = bytearray()
             with path.open("rb") as stream:
                 while chunk := stream.read(4 * 1024 * 1024):
+                    if cancelled.is_set():
+                        raise OperationCancelled()
                     contents.extend(chunk)
-                    progress.setValue(len(contents))
-                    QApplication.processEvents()
-                    if progress.wasCanceled():
-                        raise ValueError("Loading annotations was cancelled")
-            progress.setRange(0, 0)
-            progress.setLabelText(f"Parsing {path.name}…")
-            QApplication.processEvents()
-            annotation_data = json.loads(contents)
-        finally:
-            progress.close()
+                    report(len(contents))
+            report(size, f"Parsing {path.name}…")
+            return json.loads(contents)
+
+        try:
+            annotation_data = self._run_in_background(
+                "Loading annotations", f"Reading {path.name}…", max(1, size), read,
+                abandon_on_cancel=True,
+            )
+        except OperationCancelled:
+            raise ValueError("Loading annotations was cancelled") from None
         if not isinstance(annotation_data, dict) or not isinstance(annotation_data.get("images"), list):
             raise ValueError("Annotation JSON must contain an images array")
         for field in ("annotations", "categories"):
@@ -1267,7 +1310,59 @@ class ImageAnnotator(QMainWindow):
             if not isinstance(image, dict) or not isinstance(image.get("file_name"), str):
                 raise ValueError("Each image entry must have a file_name")
             image["file_name"] = image["file_name"].replace("\\", "/")
+        self._load_notes = self._repair_annotation_data(annotation_data)
         return annotation_data
+
+    @staticmethod
+    def _repair_annotation_data(annotation_data: dict[str, Any]) -> list[str]:
+        """Bring a standard COCO file up to this app's conventions; return what changed."""
+        notes = []
+        annotations = [a for a in annotation_data["annotations"] if isinstance(a, dict)]
+
+        # Legacy "Annotator" names become annotator records referenced by annotator_id.
+        annotators = annotation_data["annotators"]
+        id_by_name = {annotator["name"]: annotator["id"] for annotator in annotators}
+        id_by_folded = {name.casefold(): user_id for name, user_id in id_by_name.items()}
+        known_ids = set(id_by_name.values())
+        converted = 0
+        for annotation in annotations:
+            name = annotation.get("Annotator")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if annotation.get("annotator_id") not in known_ids:
+                name = name.strip()
+                user_id = id_by_folded.get(name.casefold())
+                if user_id is None:
+                    user_id = max(known_ids, default=0) + 1
+                    annotators.append({"id": user_id, "name": name})
+                    known_ids.add(user_id)
+                    id_by_folded[name.casefold()] = user_id
+                annotation["annotator_id"] = user_id
+            annotation.pop("Annotator", None)
+            converted += 1
+        if converted:
+            notes.append(f"{converted:,} box(es) had legacy annotator names converted to annotator records")
+
+        # Boxes may reference categories the file does not list; add them so nothing is lost.
+        categories = annotation_data["categories"]
+        category_ids = {category.get("id") for category in categories if isinstance(category, dict)}
+        names = {str(category.get("name", "")).casefold() for category in categories if isinstance(category, dict)}
+        added = []
+        for annotation in annotations:
+            category_id = annotation.get("category_id")
+            if category_id is None or category_id in category_ids:
+                continue
+            name = f"category {category_id}"
+            while name.casefold() in names:
+                name += "_"
+            categories.append({"id": category_id, "name": name})
+            category_ids.add(category_id)
+            names.add(name.casefold())
+            added.append(name)
+        if added:
+            notes.append(f"added {len(added):,} missing categor{'y' if len(added) == 1 else 'ies'}: "
+                         + ", ".join(added[:5]) + ("…" if len(added) > 5 else ""))
+        return notes
 
     def _scan_image_folder(self, root: Path) -> list[Path] | None:
         extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -1299,9 +1394,9 @@ class ImageAnnotator(QMainWindow):
         if self.current_image_id is None:
             raise ValueError("No image is selected")
         self._commit_current_scene()
-        return self.current_image_id, json.loads(json.dumps(
+        return self.current_image_id, self._copy_annotations(
             self.annotations_by_image[self.current_image_id]
-        ))
+        )
 
     def _push_undo(self) -> None:
         if self.current_image_id is None:
@@ -1332,13 +1427,12 @@ class ImageAnnotator(QMainWindow):
     def _snapshot_image_annotations(self, image_id: Any) -> tuple[Any, list[dict[str, Any]]]:
         if image_id == self.current_image_id:
             self._commit_current_scene()
-        annotations = self.annotations_by_image.get(image_id, [])
-        return image_id, json.loads(json.dumps(annotations))
+        return image_id, self._copy_annotations(self.annotations_by_image.get(image_id, []))
 
     def _restore_image_annotations(self, image_id: Any, annotations: list[dict[str, Any]]) -> None:
         if image_id not in self.image_by_id:
             return
-        restored = json.loads(json.dumps(annotations))
+        restored = self._copy_annotations(annotations)
         self.annotations_by_image[image_id] = restored
         self._set_image_roi_counts(image_id, restored)
         if image_id == self.current_image_id:
@@ -1359,11 +1453,19 @@ class ImageAnnotator(QMainWindow):
             self._refresh_annotation_list(selected_item)
             self._selection_changed()
         self._commit_current_scene()
-        self.annotation_data["annotations"] = [
-            annotation for image in self.images
-            for annotation in self.annotations_by_image[image["id"]]
-        ]
-        self.refresh_frame_list(preserve_scene=True)
+        self._update_frame_visibility(image_id)
+        self._update_frame_stats()
+
+    @staticmethod
+    def _copy_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Copy box records for undo history; bbox lists are copied, other values are never edited in place."""
+        copies = []
+        for annotation in annotations:
+            copy = dict(annotation)
+            if isinstance(copy.get("bbox"), list):
+                copy["bbox"] = list(copy["bbox"])
+            copies.append(copy)
+        return copies
 
     def _set_all_classes(self, checked: bool) -> None:
         self.class_filter.blockSignals(True)
@@ -1371,7 +1473,7 @@ class ImageAnnotator(QMainWindow):
         for row in range(self.class_filter.count()):
             self.class_filter.item(row).setCheckState(state)
         self.class_filter.blockSignals(False)
-        self.refresh_frame_list()
+        self._apply_frame_filters()
 
     def _selected_category_ids(self) -> set[Any]:
         return {
@@ -1395,38 +1497,19 @@ class ImageAnnotator(QMainWindow):
             verification == "unverified" and not verified
         )
 
-    def refresh_frame_list(
-        self, *_args, show_progress: bool = False, preserve_scene: bool = False,
-    ) -> None:
-        if not hasattr(self, "frame_list") or self._refreshing:
+    def _rebuild_frame_list(self, *, show_progress: bool = False) -> None:
+        """Create one list row per image. Only called when the set of images changes."""
+        if not hasattr(self, "frame_list"):
             return
         self._commit_current_scene()
-        self._refreshing = True
-        previous_name = None
-        previous_id = self.current_image_id
-        if self.current_image_id in self.image_by_id:
-            previous_name = self.image_by_id[self.current_image_id]["file_name"]
-        self.frame_list.blockSignals(True)
-        self.frame_list.clear()
-        filtered = []
-        selected_ids = self._selected_category_ids()
-        include_background = self.BACKGROUND_FILTER_ID in selected_ids
-        selected_categories = selected_ids - {self.BACKGROUND_FILTER_ID}
-        verification = self.verification_filter.currentData()
-        frame_verification = self.frame_verification_filter.currentData()
-        no_filter = (
-            len(selected_categories) == len(self.categories)
-            and include_background
-            and verification == "all"
-        )
         progress = None
-        if show_progress and len(self.images) >= 100:
-            progress = QProgressDialog("Building image list…", "", 0, len(self.images), self)
+        if show_progress and len(self.images) >= 2000:
+            progress = QProgressDialog("Building image list…", "", 0, 0, self)
             progress.setWindowTitle("Loading images")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
+            progress.setCancelButton(None)
             progress.show()
-            progress.raise_()
             QApplication.processEvents()
         ordered_images = sorted(
             self.images,
@@ -1436,89 +1519,155 @@ class ImageAnnotator(QMainWindow):
                 )
             ).casefold(),
         )
-        for index, image in enumerate(ordered_images, start=1):
-            if self.visible_image_ids is not None and image["id"] not in self.visible_image_ids:
-                continue
-            annotations = self.annotations_by_image[image["id"]]
-            frame_verified = self.frame_verified_by_image.get(image["id"], False)
-            matches_frame_verification = (
-                frame_verification == "all"
-                or (frame_verification == "verified" and frame_verified)
-                or (frame_verification == "unverified" and not frame_verified)
-            )
+        self._refreshing = True
+        self.frame_list.blockSignals(True)
+        self.frame_list.setUpdatesEnabled(False)
+        self.frame_list.clear()
+        self._frame_items = {}
+        self._frame_names = {}
+        for image in ordered_images:
             image_name = Path(image["file_name"]).name
-            matches_search = self.frame_search.text().strip().casefold() in image_name.casefold()
-            matches_class_filter = no_filter or (
-                include_background
-                and self.background_by_image.get(image["id"], False)
-            ) or any(
-                self._annotation_matches_filter(annotation, selected_categories, verification)
-                for annotation in annotations
-            )
-            annotator_filter = self.annotator_filter.currentData()
-            if annotator_filter == self.BACKGROUND_ANNOTATOR_FILTER_ID:
-                matches_annotator = (
-                    self.background_by_image.get(image["id"], False) and not annotations
-                )
-            elif annotator_filter == self.ALL_ANNOTATORS_FILTER_ID:
-                matches_annotator = True
-            else:
-                annotator_ids = {
-                    annotator.get("name"): annotator.get("id")
-                    for annotator in self.annotation_data.get("annotators", [])
-                    if isinstance(annotator, dict)
-                }
-                annotator_id = annotator_ids.get(annotator_filter)
-                matches_annotator = any(
-                    annotation.get("annotator_id") == annotator_id
-                    or annotation.get("Annotator") == annotator_filter
-                    for annotation in annotations
-                )
-            if (
-                matches_search and matches_frame_verification
-                and matches_class_filter and matches_annotator
-            ):
-                filtered.append(image)
-                item = QListWidgetItem(image_name)
-                item.setData(Qt.ItemDataRole.UserRole, image["id"])
-                self.frame_list.addItem(item)
-            if progress and (index % 100 == 0 or index == len(self.images)):
-                progress.setValue(index)
-                progress.setLabelText(f"Building image list…  {index:,} / {len(self.images):,}")
-                QApplication.processEvents()
-        if progress:
-            progress.close()
-        target_item = None
-        for row in range(self.frame_list.count()):
-            item = self.frame_list.item(row)
-            if item.data(Qt.ItemDataRole.UserRole) == previous_id:
-                target_item = item
-                break
-        if target_item is None:
-            for row in range(self.frame_list.count()):
-                item = self.frame_list.item(row)
-                if self.image_by_id[item.data(Qt.ItemDataRole.UserRole)]["file_name"] == previous_name:
-                    target_item = item
-                    break
-        if target_item is None and self.frame_list.count() and not preserve_scene:
-            target_item = self.frame_list.item(0)
-        if target_item is not None:
-            self.frame_list.setCurrentItem(target_item)
+            item = QListWidgetItem(image_name)
+            item.setData(Qt.ItemDataRole.UserRole, image["id"])
+            self.frame_list.addItem(item)
+            self._frame_items[image["id"]] = item
+            self._frame_names[image["id"]] = image_name.casefold()
+        self.frame_list.setUpdatesEnabled(True)
         self.frame_list.blockSignals(False)
         self._refreshing = False
-        self.previous_button.setEnabled(self.frame_list.count() > 1)
-        self.next_button.setEnabled(self.frame_list.count() > 1)
-        if target_item is not None and not preserve_scene:
-            self._load_frame(target_item.data(Qt.ItemDataRole.UserRole))
-        elif target_item is None and not preserve_scene:
-            self._clear_scene()
+        if progress:
+            progress.close()
+        self._apply_frame_filters()
+
+    def _frame_filter_context(self) -> dict[str, Any]:
+        """Read the filter widgets once, so each row check is plain dictionary work."""
+        selected_ids = self._selected_category_ids()
+        include_background = self.BACKGROUND_FILTER_ID in selected_ids
+        selected_categories = selected_ids - {self.BACKGROUND_FILTER_ID}
+        verification = self.verification_filter.currentData()
+        annotator = self.annotator_filter.currentData()
+        return {
+            "search": self.frame_search.text().strip().casefold(),
+            "frame_verification": self.frame_verification_filter.currentData(),
+            "verification": verification,
+            "categories": selected_categories,
+            "include_background": include_background,
+            "no_filter": (
+                len(selected_categories) == len(self.categories)
+                and include_background and verification == "all"
+            ),
+            "annotator": annotator,
+            "annotator_id": self._user_id_by_name.get(annotator),
+        }
+
+    def _image_matches(self, image_id: Any, context: dict[str, Any]) -> bool:
+        if self.visible_image_ids is not None and image_id not in self.visible_image_ids:
+            return False
+        if context["search"] and context["search"] not in self._frame_names.get(image_id, ""):
+            return False
+        frame_verified = self.frame_verified_by_image.get(image_id, False)
+        frame_verification = context["frame_verification"]
+        if (frame_verification == "verified" and not frame_verified) or (
+            frame_verification == "unverified" and frame_verified
+        ):
+            return False
+        annotations = self.annotations_by_image.get(image_id, [])
+        background = self.background_by_image.get(image_id, False)
+        if not (
+            context["no_filter"]
+            or (context["include_background"] and background)
+            or any(
+                self._annotation_matches_filter(
+                    annotation, context["categories"], context["verification"]
+                )
+                for annotation in annotations
+            )
+        ):
+            return False
+        annotator = context["annotator"]
+        if annotator == self.BACKGROUND_ANNOTATOR_FILTER_ID:
+            return background and not annotations
+        if annotator == self.ALL_ANNOTATORS_FILTER_ID:
+            return True
+        annotator_id = context["annotator_id"]
+        return any(
+            (annotator_id is not None and annotation.get("annotator_id") == annotator_id)
+            or annotation.get("Annotator") == annotator
+            for annotation in annotations
+        )
+
+    def _apply_frame_filters(self, *_args, select_first: bool = True) -> None:
+        """Show or hide existing rows after a filter change; rows are never recreated."""
+        if not hasattr(self, "frame_list") or self._refreshing:
+            return
+        self._commit_current_scene()
+        context = self._frame_filter_context()
+        shown = set()
+        self.frame_list.setUpdatesEnabled(False)
+        for image_id, item in self._frame_items.items():
+            matches = self._image_matches(image_id, context)
+            if item.isHidden() == matches:
+                item.setHidden(not matches)
+            if matches:
+                shown.add(image_id)
+        self.frame_list.setUpdatesEnabled(True)
+        self._shown_ids = shown
+        active_id = self._pending_image_id if self._pending_image_id is not None else self.current_image_id
+        if select_first and active_id not in shown:
+            first = self._first_shown_item()
+            if first is not None:
+                self._select_frame_item(first)
+            elif active_id is not None:
+                self._clear_scene()
+        self._update_navigation_buttons()
         self._update_frame_stats()
 
+    def _update_frame_visibility(self, image_id: Any) -> None:
+        """Re-check one image after it was edited; the rest of the list is untouched."""
+        item = self._frame_items.get(image_id)
+        if item is None:
+            return
+        matches = self._image_matches(image_id, self._frame_filter_context())
+        if item.isHidden() == matches:
+            item.setHidden(not matches)
+        if matches:
+            self._shown_ids.add(image_id)
+        else:
+            self._shown_ids.discard(image_id)
+        self._update_navigation_buttons()
+
+    def _first_shown_item(self) -> QListWidgetItem | None:
+        for row in range(self.frame_list.count()):
+            item = self.frame_list.item(row)
+            if not item.isHidden():
+                return item
+        return None
+
+    def _select_frame_item(self, item: QListWidgetItem) -> None:
+        self.frame_list.blockSignals(True)
+        self.frame_list.setCurrentItem(item)
+        self.frame_list.blockSignals(False)
+        self._load_frame(item.data(Qt.ItemDataRole.UserRole))
+
+    def _shown_neighbor(self, step: int) -> QListWidgetItem | None:
+        """Next visible row in ``step`` direction, wrapping, skipping filtered-out rows."""
+        count = self.frame_list.count()
+        row = self.frame_list.currentRow()
+        if count < 2 or row < 0:
+            return None
+        for offset in range(1, count):
+            item = self.frame_list.item((row + step * offset) % count)
+            if not item.isHidden():
+                return None if item is self.frame_list.item(row) else item
+        return None
+
+    def _update_navigation_buttons(self) -> None:
+        enough = len(self._shown_ids) > 1
+        self.previous_button.setEnabled(enough)
+        self.next_button.setEnabled(enough)
+
     def _update_frame_stats(self) -> None:
-        shown_ids = {
-            self.frame_list.item(row).data(Qt.ItemDataRole.UserRole)
-            for row in range(self.frame_list.count())
-        }
+        shown_ids = self._shown_ids
         selected = self._selected_category_ids()
         verification = self.verification_filter.currentData()
         verified_frames = sum(
@@ -1538,7 +1687,7 @@ class ImageAnnotator(QMainWindow):
                     unverified_filtered += counts[1]
         self.frame_stats.setText(
             ("No images match these filters\n" if self.images and not shown_ids else "")
-            + f"Images: {self.frame_list.count():,} filtered / {len(self.images):,}\n"
+            + f"Images: {len(shown_ids):,} filtered / {len(self.images):,}\n"
             f"Verified images: {verified_frames:,} / {total_verified_frames:,}\n"
             f"Unverified images: {unverified_frames:,} / {total_unverified_frames:,}\n"
             f"Verified boxes: {verified_filtered:,} / {self.roi_totals[0]:,}\n"
@@ -1662,11 +1811,9 @@ class ImageAnnotator(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _navigate_frames(self, step: int) -> None:
-        count = self.frame_list.count()
-        if count < 2:
-            return
-        row = self.frame_list.currentRow()
-        self.frame_list.setCurrentRow((row + step) % count)
+        item = self._shown_neighbor(step)
+        if item is not None:
+            self.frame_list.setCurrentItem(item)
 
     def _brightness_changed(self, value: int) -> None:
         self.brightness_value.setText(f"{value}%")
@@ -1691,12 +1838,11 @@ class ImageAnnotator(QMainWindow):
         self.adjustment_timer.start()
 
     def _auto_levels_requested(self) -> None:
-        if self.base_image is None:
+        if self._loaded is None:
             return
         self._auto_level_generation += 1
         generation = self._auto_level_generation
-        worker = AutoLevelsWorker(generation, self.base_image)
-        worker.signals.levels_ready.connect(self._auto_levels_finished)
+        worker = AutoLevelsWorker(generation, self._loaded.preview, self.pipeline_signals)
         self._auto_level_workers[generation] = worker
         self.auto_levels_button.setEnabled(False)
         self.status_label.setText("Estimating levels for current image…")
@@ -1708,11 +1854,22 @@ class ImageAnnotator(QMainWindow):
             return
         self.white_point.setValue(white)
         self.black_point.setValue(black)
-        self.auto_levels_button.setEnabled(self.base_image is not None)
+        self.auto_levels_button.setEnabled(self._loaded is not None)
         self.status_label.setText(f"Auto levels set for this image: black {black}, white {white}.")
 
+    def _current_adjustments(self) -> Adjustments:
+        return Adjustments(
+            self.brightness_slider.value() / 100,
+            self.contrast_slider.value() / 100,
+            self.gamma_slider.value() / 100,
+            self.invert_check.isChecked(),
+            self.black_point.value(),
+            self.white_point.value(),
+        )
+
     def _update_display_image(self) -> None:
-        if self.base_image is None or self.background_item is None:
+        """Re-adjust the cached preview (no resize) and the zoomed-in detail patch."""
+        if self._loaded is None or self.background_item is None:
             return
         if self._adjust_cancel is not None:
             self._adjust_cancel.set()
@@ -1720,38 +1877,58 @@ class ImageAnnotator(QMainWindow):
         generation = self._adjust_generation
         cancelled = threading.Event()
         self._adjust_cancel = cancelled
-        worker = ImageAdjustmentWorker(
-            generation,
-            self.base_image,
-            self.brightness_slider.value() / 100,
-            self.contrast_slider.value() / 100,
-            self.gamma_slider.value() / 100,
-            self.invert_check.isChecked(),
-            self.black_point.value(),
-            self.white_point.value(),
-            cancelled,
+        worker = PreviewAdjustmentWorker(
+            generation, self._loaded, self._current_adjustments(), cancelled, self.pipeline_signals
         )
-        worker.signals.finished.connect(self._adjustment_finished)
         self._adjust_workers[generation] = worker
         self.adjustment_pool.start(worker)
+        self.detail_timer.start()
 
     def _apply_display_adjustments(self, image: Image.Image) -> Image.Image:
-        return apply_image_adjustments(
-            image,
-            self.brightness_slider.value() / 100,
-            self.contrast_slider.value() / 100,
-            self.gamma_slider.value() / 100,
-            self.invert_check.isChecked(),
-            self.black_point.value(),
-            self.white_point.value(),
-        )
+        return apply_image_adjustments(image, self._current_adjustments())
 
-    def _adjustment_finished(self, generation: int, image: QImage | None, scale: float) -> None:
+    def _adjustment_finished(self, generation: int, image: QImage | None) -> None:
         self._adjust_workers.pop(generation, None)
-        if generation != self._adjust_generation or image is None or self.background_item is None:
+        if (generation != self._adjust_generation or image is None
+                or self.background_item is None or self._loaded is None):
             return
         self.background_item.setPixmap(QPixmap.fromImage(image))
-        self.background_item.setScale(scale)
+        self.background_item.setScale(self._loaded.preview_scale)
+
+    def _update_detail(self) -> None:
+        """Show full-resolution pixels for the visible area once the preview is magnified."""
+        self._detail_generation += 1
+        loaded, detail = self._loaded, self.detail_item
+        if loaded is None or detail is None:
+            return
+        zoom = abs(self.view.transform().m11())
+        if loaded.preview_scale <= 1.0 or zoom * loaded.preview_scale <= 1.0:
+            detail.hide()
+            return
+        visible = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
+        area = visible.intersected(QRectF(0, 0, loaded.full.width, loaded.full.height))
+        if area.isEmpty():
+            detail.hide()
+            return
+        pad_x, pad_y = area.width() * 0.25, area.height() * 0.25
+        box = (
+            max(0, math.floor(area.left() - pad_x)),
+            max(0, math.floor(area.top() - pad_y)),
+            min(loaded.full.width, math.ceil(area.right() + pad_x)),
+            min(loaded.full.height, math.ceil(area.bottom() + pad_y)),
+        )
+        generation = self._detail_generation
+        worker = DetailWorker(generation, loaded, box, self._current_adjustments(), self.pipeline_signals)
+        self._detail_workers[generation] = worker
+        self.adjustment_pool.start(worker)
+
+    def _detail_finished(self, generation: int, image: QImage, left: int, top: int) -> None:
+        self._detail_workers.pop(generation, None)
+        if generation != self._detail_generation or self.detail_item is None:
+            return
+        self.detail_item.setPixmap(QPixmap.fromImage(image))
+        self.detail_item.setPos(left, top)
+        self.detail_item.show()
 
     def _update_scale_bar(self, *_args) -> None:
         if self.scale_bar_item is None:
@@ -1785,10 +1962,7 @@ class ImageAnnotator(QMainWindow):
         bar_height = max(5, width / 450)
         label = format_length(display_length_mm)
         font_size = max(12, min(40, round(width / 50)))
-        try:
-            font = ImageFont.truetype("DejaVuSans.ttf", font_size)
-        except OSError:
-            font = ImageFont.load_default()
+        font = self._label_font(font_size)
         draw = ImageDraw.Draw(image)
         text_box = draw.textbbox((0, 0), label, font=font)
         label_width = text_box[2] - text_box[0]
@@ -1802,6 +1976,19 @@ class ImageAnnotator(QMainWindow):
         draw.rectangle((left, top, left + bar_width, top + bar_height), fill="black")
         draw.text((label_left, label_top), label, fill="black", font=font)
         return True
+
+    @staticmethod
+    def _label_font(size: int):
+        """Standard sans-serif font at ``size``: Arial on Windows, DejaVu/Liberation on Linux."""
+        for name in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"):
+            try:
+                return ImageFont.truetype(name, size)
+            except OSError:
+                continue
+        try:
+            return ImageFont.load_default(size)  # Pillow >= 10.1 renders a scalable default
+        except TypeError:
+            return ImageFont.load_default()
 
     def _scale_bar_export_options(self, layout: QFormLayout):
         if not self.show_scale_bar.isChecked():
@@ -1867,6 +2054,95 @@ class ImageAnnotator(QMainWindow):
             return None
         return Path(dialog.selectedFiles()[0]).resolve()
 
+    def _run_in_background(self, title: str, label: str, total: int, work,
+                           *, abandon_on_cancel: bool = False):
+        """Run ``work(report, cancelled)`` on a thread behind a modal progress dialog.
+
+        The window keeps repainting while the task runs. ``report(done, text)``
+        updates the dialog; Cancel sets ``cancelled`` and ``work`` decides how to
+        stop. With ``abandon_on_cancel`` the call returns at once on Cancel and
+        the thread's result is discarded (for read-only work such as parsing).
+        """
+        state = {"done": 0, "label": label, "finished": False, "result": None, "error": None}
+        cancelled = threading.Event()
+
+        def report(done: int, text: str | None = None) -> None:
+            state["done"] = done
+            if text:
+                state["label"] = text
+
+        def target() -> None:
+            try:
+                state["result"] = work(report, cancelled)
+            except BaseException as error:  # noqa: BLE001 - re-raised on the UI thread
+                state["error"] = error
+            finally:
+                state["finished"] = True
+
+        progress = QProgressDialog(label, "Cancel", 0, max(0, total), self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        loop = QEventLoop(self)
+
+        def poll() -> None:
+            if total:
+                progress.setValue(min(state["done"], total))
+            progress.setLabelText(state["label"])
+            if progress.wasCanceled() and not cancelled.is_set():
+                cancelled.set()
+                progress.setLabelText("Cancelling…")
+            if state["finished"] or (abandon_on_cancel and cancelled.is_set()):
+                loop.quit()
+
+        timer = QTimer(self)
+        timer.setInterval(50)
+        timer.timeout.connect(poll)
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        timer.start()
+        if not state["finished"]:
+            loop.exec()
+        timer.stop()
+        progress.close()
+        if abandon_on_cancel and cancelled.is_set() and not state["finished"]:
+            raise OperationCancelled()
+        thread.join()
+        if state["error"] is not None:
+            raise state["error"]
+        return state["result"]
+
+    @staticmethod
+    def _copy_then_write_json(copies: list[tuple[Path, Path]], data: dict[str, Any],
+                              save_path: Path, report, cancelled: threading.Event) -> None:
+        """Copy images, then write the JSON; on any failure remove the copies made here."""
+        created: list[Path] = []
+        try:
+            for index, (source, target) in enumerate(copies, start=1):
+                if cancelled.is_set():
+                    raise OperationCancelled()
+                if target.exists():
+                    raise OSError(f"{target} already exists and was not overwritten.")
+                report(index - 1, f"Copying {source.name} ({index:,} of {len(copies):,})…")
+                created.append(target)
+                shutil.copy2(source, target)
+            if cancelled.is_set():
+                raise OperationCancelled()
+            report(len(copies), f"Writing {save_path.name}…")
+            text = json.dumps(data, indent=2) + "\n"
+            temporary_path = save_path.with_name(save_path.name + ".tmp")
+            temporary_path.write_text(text, encoding="utf-8")
+            temporary_path.replace(save_path)
+        except BaseException:
+            for path in created:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+
     def save_project(self) -> bool:
         return self._save_project(self.annotations_path)
 
@@ -1916,39 +2192,29 @@ class ImageAnnotator(QMainWindow):
         if self._project_image_names is None:
             self._project_image_names = directory_names(self.root)
         existing_names = self._project_image_names
-        exported_images = []
-        exported_ids = set()
+        # Plan every image first; nothing on disk or in memory changes until all checks pass.
+        plan: list[tuple[dict[str, Any], Path, bool]] = []
+        planned_names: set[str] = set()
         conflicts: list[tuple[Path, Path]] = []
         missing: list[Path] = []
         for image in export_images:
-            image_id = image["id"]
             source = self._source_image_path(image)
             if source is None:
                 missing.append(Path(image["file_name"]))
                 continue
             target_name = Path(image["file_name"]).name
             target = self.root / target_name
+            key = target_name.casefold()
             same_path = path_key(source) == path_key(target)
-            if target_name.casefold() in existing_names and not same_path:
+            if not same_path and (key in existing_names or key in planned_names):
                 conflicts.append((source, target))
                 continue
-            if same_path and target_name.casefold() not in existing_names:
+            if same_path and key not in existing_names:
                 missing.append(source)
                 continue
-            try:
-                if not same_path:
-                    shutil.copy2(source, target)
-            except OSError as error:
-                QMessageBox.critical(self, "Cannot package image", str(error))
-                return False
-
-            image["file_name"] = target.name
-            image["frame_verified"] = self.frame_verified_by_image.get(image_id, False)
-            image["background"] = self.background_by_image.get(image_id, False)
-            self.source_paths_by_image[image_id] = target
-            existing_names.add(target.name.casefold())
-            exported_images.append(dict(image))
-            exported_ids.add(image_id)
+            if not same_path:
+                planned_names.add(key)
+            plan.append((image, target, not same_path))
 
         if conflicts:
             self._show_duplicate_summary(conflicts, 0)
@@ -1961,30 +2227,59 @@ class ImageAnnotator(QMainWindow):
             )
             return False
 
+        records = []
+        exported_ids = set()
+        for image, target, _needs_copy in plan:
+            record = dict(image)
+            record["file_name"] = target.name
+            record["frame_verified"] = self.frame_verified_by_image.get(image["id"], False)
+            record["background"] = self.background_by_image.get(image["id"], False)
+            records.append(record)
+            exported_ids.add(image["id"])
         packaged_annotations = [
             annotation for annotation in export_annotations
             if annotation["image_id"] in exported_ids
         ]
         project_data = dict(self.annotation_data)
-        project_data["images"] = exported_images
+        project_data["images"] = records
         project_data["annotations"] = packaged_annotations
-        temporary_path = save_path.with_name(save_path.name + ".tmp")
+        copies = [
+            (self._source_image_path(image), target)
+            for image, target, needs_copy in plan if needs_copy
+        ]
         try:
-            temporary_path.write_text(json.dumps(project_data, indent=2) + "\n", encoding="utf-8")
-            temporary_path.replace(save_path)
-        except OSError as error:
-            QMessageBox.critical(self, "Save project failed", str(error))
+            self._run_in_background(
+                "Saving project", f"Saving {save_path.name}…", len(copies) + 1,
+                lambda report, cancelled: self._copy_then_write_json(
+                    copies, project_data, save_path, report, cancelled
+                ),
+            )
+        except OperationCancelled:
+            self.status_label.setText("Save cancelled; no project files were changed.")
             return False
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Save project failed",
+                f"{error}\n\nNo project files were changed; images copied during this save were removed.",
+            )
+            return False
+
+        for image, target, needs_copy in plan:
+            image["file_name"] = target.name
+            image["frame_verified"] = self.frame_verified_by_image.get(image["id"], False)
+            image["background"] = self.background_by_image.get(image["id"], False)
+            self.source_paths_by_image[image["id"]] = target
+            if needs_copy:
+                existing_names.add(target.name.casefold())
         self.output_path = save_path
         self.annotations_path = save_path
         self.persisted_image_ids = exported_ids
         self.touched_image_ids.clear()
         self.dirty = False
         self.status_label.setText(
-            f"Saved {len(exported_images):,} image(s) and {len(packaged_annotations):,} annotation boxes "
+            f"Saved {len(records):,} image(s) and {len(packaged_annotations):,} annotation boxes "
             f"to {save_path}"
         )
-        self.refresh_frame_list(preserve_scene=True)
         return True
 
     def export_training_dataset(self) -> None:
@@ -2035,7 +2330,8 @@ class ImageAnnotator(QMainWindow):
             return
 
         existing_names = directory_names(destination)
-        exported_images = []
+        plan: list[tuple[dict[str, Any], Path, Path, bool]] = []
+        planned_names: set[str] = set()
         conflicts = []
         missing = []
         for image in training_images:
@@ -2045,28 +2341,17 @@ class ImageAnnotator(QMainWindow):
                 continue
             name = Path(image["file_name"]).name
             target = destination / name
+            key = name.casefold()
             same_path = path_key(source) == path_key(target)
-            if name.casefold() in existing_names and not same_path:
+            if not same_path and (key in existing_names or key in planned_names):
                 conflicts.append((source, target))
                 continue
-            if same_path and name.casefold() not in existing_names:
+            if same_path and key not in existing_names:
                 missing.append(source)
                 continue
-            try:
-                if not same_path:
-                    shutil.copy2(source, target)
-            except OSError as error:
-                QMessageBox.critical(self, "Training export failed", str(error))
-                return
-            record = dict(image)
-            try:
-                record["file_name"] = Path(os.path.relpath(target, save_path.parent)).as_posix()
-            except ValueError:  # Different Windows drives have no relative path.
-                record["file_name"] = target.as_posix()
-            record["frame_verified"] = True
-            record["background"] = self.background_by_image.get(image["id"], False)
-            exported_images.append(record)
-            existing_names.add(name.casefold())
+            if not same_path:
+                planned_names.add(key)
+            plan.append((image, source, target, not same_path))
 
         if conflicts:
             self._show_duplicate_summary(conflicts, 0)
@@ -2078,6 +2363,16 @@ class ImageAnnotator(QMainWindow):
             )
             return
 
+        exported_images = []
+        for image, _source, target, _needs_copy in plan:
+            record = dict(image)
+            try:
+                record["file_name"] = Path(os.path.relpath(target, save_path.parent)).as_posix()
+            except ValueError:  # Different Windows drives have no relative path.
+                record["file_name"] = target.as_posix()
+            record["frame_verified"] = True
+            record["background"] = self.background_by_image.get(image["id"], False)
+            exported_images.append(record)
         export_data = dict(self.annotation_data)
         export_data["images"] = exported_images
         exported_ids = {image["id"] for image in exported_images}
@@ -2089,14 +2384,22 @@ class ImageAnnotator(QMainWindow):
         info = dict(source_info) if isinstance(source_info, dict) else {}
         export_data["info"] = info
         info["description"] = "Verified training subset exported from Stingray Label"
-        temporary_path = save_path.with_name(save_path.name + ".tmp")
+        copies = [(source, target) for _image, source, target, needs_copy in plan if needs_copy]
         try:
-            temporary_path.write_text(
-                json.dumps(export_data, indent=2) + "\n", encoding="utf-8"
+            self._run_in_background(
+                "Exporting training dataset", f"Exporting to {destination}…", len(copies) + 1,
+                lambda report, cancelled: self._copy_then_write_json(
+                    copies, export_data, save_path, report, cancelled
+                ),
             )
-            temporary_path.replace(save_path)
+        except OperationCancelled:
+            self.status_label.setText("Training export cancelled; copied images were removed.")
+            return
         except OSError as error:
-            QMessageBox.critical(self, "Training export failed", str(error))
+            QMessageBox.critical(
+                self, "Training export failed",
+                f"{error}\n\nImages copied during this export were removed.",
+            )
             return
         self.status_label.setText(
             f"Exported {len(exported_images):,} verified image(s) and "
@@ -2228,8 +2531,68 @@ class ImageAnnotator(QMainWindow):
             saved += 1
         self.status_label.setText(f"Exported {saved} box image(s) to {output_dir}")
 
+    def _image_path(self, image_id: Any) -> Path | None:
+        path = self.source_paths_by_image.get(image_id)
+        if path is not None or self.root is None:
+            return path
+        try:
+            return dataset_image_path(self.root, self.image_by_id[image_id]["file_name"])
+        except ValueError:
+            return None
+
+    def _request_image(self, image_id: Any) -> None:
+        """Start decoding on a worker unless it is cached or already loading."""
+        key = (self._dataset_generation, image_id)
+        if image_id in self._image_cache or key in self._load_workers:
+            return
+        path = self._image_path(image_id)
+        if path is None:
+            return
+        worker = ImageLoadWorker(key, path, self.pipeline_signals)
+        self._load_workers[key] = worker
+        self.image_pool.start(worker)
+
+    def _cache_image(self, image_id: Any, loaded: LoadedImage) -> None:
+        self._image_cache[image_id] = loaded
+        self._image_cache.move_to_end(image_id)
+        keep = {self.current_image_id, self._pending_image_id}
+        for cached_id in list(self._image_cache):
+            if len(self._image_cache) <= IMAGE_CACHE_SIZE:
+                break
+            if cached_id not in keep:
+                del self._image_cache[cached_id]
+
+    def _prefetch_neighbors(self) -> None:
+        for step in (-1, 1):
+            item = self._shown_neighbor(step)
+            if item is None:
+                continue
+            image_id = item.data(Qt.ItemDataRole.UserRole)
+            if image_id in self._image_cache:
+                self._image_cache.move_to_end(image_id)
+            else:
+                self._request_image(image_id)
+
+    def _image_loaded(self, key: tuple[int, Any], loaded: LoadedImage) -> None:
+        self._load_workers.pop(key, None)
+        generation, image_id = key
+        if generation != self._dataset_generation or image_id not in self.image_by_id:
+            return
+        self._cache_image(image_id, loaded)
+        if image_id == self._pending_image_id:
+            self._show_image(image_id, loaded)
+
+    def _image_failed(self, key: tuple[int, Any], message: str) -> None:
+        self._load_workers.pop(key, None)
+        generation, image_id = key
+        if generation != self._dataset_generation or image_id != self._pending_image_id:
+            return
+        self._pending_image_id = None
+        self.image_info.setText("Image could not be loaded")
+        QMessageBox.critical(self, "Cannot load image", message)
+
     def _load_frame(self, image_id: Any) -> None:
-        if image_id == self.current_image_id:
+        if image_id in (self.current_image_id, self._pending_image_id):
             return
         self._auto_level_generation += 1
         self.auto_levels_button.setEnabled(False)
@@ -2238,44 +2601,66 @@ class ImageAnnotator(QMainWindow):
         self._commit_current_scene()
         self.view.clear_drawing_guides()
         self._cancel_image_adjustment()
+        self._detail_generation += 1
         self.scene.clear()
         self.scene.setSceneRect(QRectF())
         self.current_items = []
         self.scale_bar_item = None
         self.background_item = None
+        self.detail_item = None
         self.base_image = None
-        image = self.image_by_id[image_id]
-        path = self.source_paths_by_image.get(image_id)
-        if path is None:
-            try:
-                if self.root is None:
-                    raise ValueError("Choose a project folder first")
-                path = dataset_image_path(self.root, image["file_name"])
-            except ValueError as error:
-                QMessageBox.critical(self, "Invalid image path", str(error))
-                self.current_image_id = None
-                return
-        try:
-            with Image.open(path) as source_image:
-                self.base_image = source_image.convert("RGB")
-        except OSError:
-            self.base_image = None
-        if self.base_image is None:
-            QMessageBox.critical(self, "Cannot load image", f"Could not open image:\n{path}")
-            self.current_image_id = None
+        self._loaded = None
+        self.current_image_id = None
+        self.annotation_list.clear()
+        if self._image_path(image_id) is None:
+            QMessageBox.critical(
+                self, "Invalid image path",
+                f"Cannot resolve the image file for {self.image_by_id[image_id]['file_name']!r}.",
+            )
+            self._pending_image_id = None
+            self._sync_frame_controls()
             return
+        self._pending_image_id = image_id
+        self._sync_frame_controls()
+        cached = self._image_cache.get(image_id)
+        if cached is not None:
+            self._image_cache.move_to_end(image_id)
+            self._show_image(image_id, cached)
+            return
+        name = Path(self.image_by_id[image_id]["file_name"]).name
+        self.image_name_label.setText(name)
+        self.image_info.setText(f"Loading {name}…")
+        self._request_image(image_id)
+
+    def _show_image(self, image_id: Any, loaded: LoadedImage) -> None:
+        self._pending_image_id = None
+        self._loaded = loaded
+        self.base_image = loaded.full
         self.auto_levels_button.setEnabled(True)
-        image["width"] = self.base_image.width
-        image["height"] = self.base_image.height
+        image = self.image_by_id[image_id]
+        width, height = loaded.full.size
+        image["width"] = width
+        image["height"] = height
         self.background_item = QGraphicsPixmapItem()
         self.background_item.setZValue(-10)
         self.background_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.background_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.scene.addItem(self.background_item)
-        self.scene.setSceneRect(QRectF(0, 0, self.base_image.width, self.base_image.height))
-        self.scale_bar_item = ScaleBarItem(self.base_image.width, self.base_image.height)
+        self.detail_item = QGraphicsPixmapItem()
+        self.detail_item.setZValue(-9)
+        self.detail_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.detail_item.hide()
+        self.scene.addItem(self.detail_item)
+        self.scene.setSceneRect(QRectF(0, 0, width, height))
+        self.scale_bar_item = ScaleBarItem(width, height)
         self.scene.addItem(self.scale_bar_item)
         self._update_scale_bar()
-        self._update_display_image()
+        if self._current_adjustments().is_identity:
+            self.background_item.setPixmap(QPixmap.fromImage(loaded.preview_qimage))
+            self.background_item.setScale(loaded.preview_scale)
+        else:
+            # Leave the view blank for the few ms the adjusted preview takes, rather than flash raw pixels.
+            self._update_display_image()
         self.current_image_id = image_id
         for annotation in self.annotations_by_image[image_id]:
             category_name = self.categories.get(annotation["category_id"], "unknown")
@@ -2291,6 +2676,7 @@ class ImageAnnotator(QMainWindow):
         self._sync_frame_controls()
         self._selection_changed()
         self._update_frame_stats()
+        self._prefetch_neighbors()
 
     def _clear_scene(self) -> None:
         if self.view.calibration_mode:
@@ -2300,13 +2686,17 @@ class ImageAnnotator(QMainWindow):
         self.auto_levels_button.setEnabled(False)
         self.view.clear_drawing_guides()
         self._cancel_image_adjustment()
+        self._detail_generation += 1
         self.scene.clear()
         self.scene.setSceneRect(QRectF())
         self.current_items = []
         self.base_image = None
+        self._loaded = None
         self.background_item = None
+        self.detail_item = None
         self.scale_bar_item = None
         self.current_image_id = None
+        self._pending_image_id = None
         self.edit_class.setEnabled(False)
         self.edit_status.setEnabled(False)
         self.delete_button.setEnabled(False)
@@ -2368,6 +2758,9 @@ class ImageAnnotator(QMainWindow):
         self.dirty = True
         if touch_image and self.current_image_id is not None:
             self.touched_image_ids.add(self.current_image_id)
+            # An edit can only change whether this one image matches the filters.
+            self._commit_current_scene()
+            self._update_frame_visibility(self.current_image_id)
         self.status_label.setText("Unsaved annotation edits")
         if counts_changed:
             self._refresh_current_roi_counts()
@@ -2381,8 +2774,6 @@ class ImageAnnotator(QMainWindow):
         if self.current_annotator:
             self._set_annotation_annotator(annotation)
         self._mark_dirty(counts_changed=counts_changed)
-        self._refresh_annotator_filter()
-        self.refresh_frame_list(preserve_scene=True)
 
     def _sync_frame_controls(self) -> None:
         image_id = self.current_image_id
@@ -2423,7 +2814,8 @@ class ImageAnnotator(QMainWindow):
         self.touched_image_ids.add(image_id)
         self.dirty = True
         self.status_label.setText("Image verification changed — unsaved changes")
-        self.refresh_frame_list(preserve_scene=True)
+        self._update_frame_visibility(image_id)
+        self._update_frame_stats()
 
     def _background_changed(self, checked: bool) -> None:
         image_id = self.current_image_id
@@ -2441,7 +2833,8 @@ class ImageAnnotator(QMainWindow):
         self.dirty = True
         self.status_label.setText("Background status changed — unsaved changes")
         self._sync_frame_controls()
-        self.refresh_frame_list(preserve_scene=True)
+        self._update_frame_visibility(image_id)
+        self._update_frame_stats()
 
     def _set_draw_mode(self, enabled: bool) -> None:
         if enabled and (self.current_annotator is None or self.current_image_id is None
@@ -2532,10 +2925,9 @@ class ImageAnnotator(QMainWindow):
         self.annotation_list.blockSignals(True)
         self.annotation_list.clear()
         selected_row = -1
-        names_by_id = self._user_names_by_id()
         for row, item in enumerate(self.current_items):
             status = "verified" if is_verified(item.annotation.get("verified", True)) else "unverified"
-            user_name = self._annotation_user_name(item.annotation, names_by_id)
+            user_name = self._annotation_user_name(item.annotation)
             text = f"{item.category_name} · {status} · User: {user_name}"
             list_item = QListWidgetItem(text)
             color_swatch = QPixmap(12, 12)
@@ -2802,10 +3194,6 @@ class ImageAnnotator(QMainWindow):
         for annotation in self._history_annotations():
             if annotation.get("category_id") == source_id:
                 annotation["category_id"] = target_id
-        self.annotation_data["annotations"] = [
-            annotation for image in self.images
-            for annotation in self.annotations_by_image[image["id"]]
-        ]
         self.annotation_data["categories"] = [
             category for category in self.annotation_data.get("categories", [])
             if category.get("id") != source_id
@@ -2829,8 +3217,7 @@ class ImageAnnotator(QMainWindow):
             self._set_image_roi_counts(image_id, annotations)
         self._selection_changed()
         self._mark_dirty(counts_changed=True, touch_image=False)
-        self._refresh_annotator_filter()
-        self.refresh_frame_list(preserve_scene=True)
+        self._apply_frame_filters(select_first=False)
         self.status_label.setText(
             f"Merged category {source_name!r} into {target_name!r} — unsaved changes"
         )

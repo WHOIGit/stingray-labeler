@@ -14,7 +14,7 @@ from typing import Any
 
 try:
     from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QRunnable, QThreadPool, QTimer, Signal
-    from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap
+    from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -50,10 +50,73 @@ try:
 except ImportError as error:
     raise SystemExit("Install the GUI dependencies with: python -m pip install PySide6 Pillow") from error
 
-class BoxItem(QGraphicsRectItem):
-    """Selectable, movable, and corner/edge-resizable annotation box."""
+class HandleItem(QGraphicsItem):
+    """Corner resize handle drawn in screen pixels; the drawn circle is exactly the clickable area."""
 
-    HANDLE_RADIUS = 5.0
+    def __init__(self, box: "BoxItem", corner: str):
+        super().__init__(box)
+        self.box = box
+        self.corner = corner
+        self.radius = BoxItem.HANDLE_MAX_PX
+        self._hovered = False
+        # Child of the box, but sized in screen pixels whatever the zoom.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setZValue(1)
+        self.hide()
+
+    def set_radius(self, radius: float) -> None:
+        if radius != self.radius:
+            self.prepareGeometryChange()
+            self.radius = radius
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        extent = self.radius + 1.5
+        return QRectF(-extent, -extent, extent * 2, extent * 2)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addEllipse(QPointF(0, 0), self.radius, self.radius)
+        return path
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        fill = QColor(self.box.color())
+        fill.setAlpha(255 if self._hovered else 150)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(255, 255, 255) if self._hovered else QColor(0, 0, 0), 1.5))
+        painter.setBrush(QBrush(fill))
+        painter.drawEllipse(QPointF(0, 0), self.radius, self.radius)
+
+    def hoverEnterEvent(self, event) -> None:  # noqa: N802
+        self._hovered = True
+        self.update()
+
+    def hoverLeaveEvent(self, event) -> None:  # noqa: N802
+        self._hovered = False
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.box.begin_resize()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        self.box.resize_corner(self.corner, event.scenePos())
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self.box.end_resize()
+        event.accept()
+
+
+class BoxItem(QGraphicsRectItem):
+    """Selectable, movable, and corner-resizable annotation box."""
+
+    HANDLE_MAX_PX = 6.0  # handle radius in screen pixels for a box that is large on screen
+    HANDLE_MIN_PX = 3.0  # never smaller than this, so it stays visible and grabbable
+    HANDLE_BOX_FRACTION = 0.2  # on small boxes, radius follows the box's on-screen size
+    OUTLINE_PX = 3.0
     MIN_SIZE = 2.0
     selection_color = QColor(255, 255, 0)
     class_colors: dict[Any, QColor] = {}
@@ -65,11 +128,9 @@ class BoxItem(QGraphicsRectItem):
         self.category_name = category_name
         self.changed = changed
         self.before_change = before_change
-        self._resize_handle: str | None = None
         self._undo_started = False
         self._geometry_changed = False
-        self._resize_start = QPointF()
-        self._resize_rect = QRectF()
+        self._pad = self.OUTLINE_PX
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsItem.GraphicsItemFlag.ItemIsMovable
@@ -77,6 +138,8 @@ class BoxItem(QGraphicsRectItem):
         )
         self.setAcceptHoverEvents(True)
         self.setZValue(5)
+        self.handles = {"nw": HandleItem(self, "nw"), "se": HandleItem(self, "se")}
+        self.update_handles()
 
     def color(self) -> QColor:
         category_id = self.annotation["category_id"]
@@ -85,102 +148,119 @@ class BoxItem(QGraphicsRectItem):
             QColor.fromHsv((int(category_id) * 137) % 360, 210, 235),
         )
 
+    def _view_scale(self) -> float:
+        scene = self.scene()
+        views = scene.views() if scene is not None else []
+        return abs(views[0].transform().m11()) if views else 1.0
+
+    def update_handles(self) -> None:
+        """Place and size handles for the current zoom; called on zoom, resize and selection."""
+        scale = max(self._view_scale(), 1e-9)
+        rect = self.rect()
+        on_screen = min(rect.width(), rect.height()) * scale
+        radius = min(self.HANDLE_MAX_PX,
+                     max(self.HANDLE_MIN_PX, on_screen * self.HANDLE_BOX_FRACTION))
+        corners = {"nw": rect.topLeft(), "se": rect.bottomRight()}
+        for name, handle in self.handles.items():
+            handle.set_radius(radius)
+            handle.setPos(corners[name])
+            handle.setVisible(self.isSelected())
+        # Keep the cosmetic outline inside the bounding rect at any zoom.
+        pad = self.OUTLINE_PX / scale
+        if pad != self._pad:
+            self.prepareGeometryChange()
+            self._pad = pad
+
     def boundingRect(self) -> QRectF:  # noqa: N802
-        return self.rect().adjusted(
-            -self.HANDLE_RADIUS, -self.HANDLE_RADIUS,
-            self.HANDLE_RADIUS, self.HANDLE_RADIUS,
-        )
+        return self.rect().adjusted(-self._pad, -self._pad, self._pad, self._pad)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
-        color = self.color()
-        outline = QPen(self.selection_color if self.isSelected() else color, 3.0)
+        outline = QPen(self.selection_color if self.isSelected() else self.color(), self.OUTLINE_PX)
         if self.isSelected():
             outline.setStyle(Qt.PenStyle.DashLine)
         outline.setCosmetic(True)
         painter.setPen(outline)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(self.rect())
-        if self.isSelected():
-            handle_pen = QPen(color, 1.0)
-            handle_pen.setCosmetic(True)
-            painter.setPen(handle_pen)
-            painter.setBrush(QBrush(color))
-            for point in self._handles().values():
-                radius = self.HANDLE_RADIUS
-                painter.drawEllipse(QRectF(point.x() - radius, point.y() - radius,
-                                           radius * 2, radius * 2))
 
-    def _handles(self) -> dict[str, QPointF]:
-        rect = self.rect()
-        return {"nw": rect.topLeft(), "se": rect.bottomRight()}
+    def begin_resize(self) -> None:
+        self._undo_started = False
+        self._geometry_changed = False
 
-    def _handle_at(self, point: QPointF) -> str | None:
-        for name, handle in self._handles().items():
-            if ((point - handle).manhattanLength() <= self.HANDLE_RADIUS * 2):
-                return name
-        return None
+    def resize_corner(self, corner: str, scene_pos: QPointF) -> None:
+        if not self._undo_started:
+            if self.before_change:
+                self.before_change()
+            self._undo_started = True
+        bounds = self._image_bounds()
+        if bounds is not None:
+            scene_pos = QPointF(
+                min(max(scene_pos.x(), bounds.left()), bounds.right()),
+                min(max(scene_pos.y(), bounds.top()), bounds.bottom()),
+            )
+        point = self.mapFromScene(scene_pos)
+        rect = QRectF(self.rect())
+        if corner == "nw":
+            rect.setLeft(min(point.x(), rect.right() - self.MIN_SIZE))
+            rect.setTop(min(point.y(), rect.bottom() - self.MIN_SIZE))
+        else:
+            rect.setRight(max(point.x(), rect.left() + self.MIN_SIZE))
+            rect.setBottom(max(point.y(), rect.top() + self.MIN_SIZE))
+        if rect != self.rect():
+            self.setRect(rect)
+            self.update_handles()
+            self._geometry_changed = True
+
+    def end_resize(self) -> None:
+        self._undo_started = False
+        if self._geometry_changed:
+            self.changed(self.annotation)
+        self._geometry_changed = False
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        handle = self._handle_at(event.pos()) if self.isSelected() else None
-        if handle and event.button() == Qt.MouseButton.LeftButton:
-            self._undo_started = False
-            self._geometry_changed = False
-            self._resize_handle = handle
-            self._resize_start = event.pos()
-            self._resize_rect = self.rect()
-            event.accept()
-            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._undo_started = False
             self._geometry_changed = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if not self._resize_handle:
-            if event.buttons() & Qt.MouseButton.LeftButton and not self._undo_started:
-                if self.before_change:
-                    self.before_change()
-                self._undo_started = True
-            super().mouseMoveEvent(event)
-            return
-        if not self._undo_started:
+        if event.buttons() & Qt.MouseButton.LeftButton and not self._undo_started:
             if self.before_change:
                 self.before_change()
             self._undo_started = True
-        delta = event.pos() - self._resize_start
-        rect = QRectF(self._resize_rect)
-        if "w" in self._resize_handle:
-            rect.setLeft(min(rect.left() + delta.x(), rect.right() - self.MIN_SIZE))
-        if "e" in self._resize_handle:
-            rect.setRight(max(rect.right() + delta.x(), rect.left() + self.MIN_SIZE))
-        if "n" in self._resize_handle:
-            rect.setTop(min(rect.top() + delta.y(), rect.bottom() - self.MIN_SIZE))
-        if "s" in self._resize_handle:
-            rect.setBottom(max(rect.bottom() + delta.y(), rect.top() + self.MIN_SIZE))
-        if rect != self.rect():
-            self.setRect(rect)
-            self._geometry_changed = True
-        event.accept()
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if self._resize_handle:
-            self._resize_handle = None
-            self._undo_started = False
-            if self._geometry_changed:
-                self.changed(self.annotation)
-            self._geometry_changed = False
-            event.accept()
-            return
         self._undo_started = False
         super().mouseReleaseEvent(event)
         if self._geometry_changed:
             self.changed(self.annotation)
         self._geometry_changed = False
 
+    def _image_bounds(self) -> QRectF | None:
+        """The image area; boxes are kept inside it while moving and resizing."""
+        scene = self.scene()
+        if scene is None or scene.sceneRect().isEmpty():
+            return None
+        return scene.sceneRect()
+
     def itemChange(self, change, value):  # noqa: N802
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            bounds = self._image_bounds()
+            if bounds is not None:
+                rect = self.rect()
+                # Position offsets rect; clamp the offset so the whole box stays on the image.
+                x = min(max(value.x(), bounds.left() - rect.left()), bounds.right() - rect.right())
+                y = min(max(value.y(), bounds.top() - rect.top()), bounds.bottom() - rect.bottom())
+                value = QPointF(x, y)
         result = super().itemChange(change, value)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self._geometry_changed = True
+        elif change in (
+            QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged,
+            QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged,
+        ):
+            self.update_handles()
         return result
 
     def scene_bbox(self) -> list[float]:
@@ -503,7 +583,7 @@ class AnnotationView(QGraphicsView):
         if (
             not self.draw_mode
             and event.button() == Qt.MouseButton.LeftButton
-            and not isinstance(item, BoxItem)
+            and not isinstance(item, (BoxItem, HandleItem))
             and (self.horizontalScrollBar().maximum() > 0 or self.verticalScrollBar().maximum() > 0)
         ):
             self._pan_last = event.position().toPoint()
@@ -594,12 +674,20 @@ class AnnotationView(QGraphicsView):
         factor = max(fit_scale / current_scale, factor)
         self.scale(factor, factor)
         self._manual_zoom = True
+        self._zoom_changed()
         self.viewChanged.emit()
         event.accept()
+
+    def _zoom_changed(self) -> None:
+        """Box handles and outlines are sized in screen pixels, so refresh them per zoom."""
+        for item in self.scene().items():
+            if isinstance(item, BoxItem):
+                item.update_handles()
 
     def fit_image(self) -> None:
         if not self._manual_zoom and not self.scene().sceneRect().isEmpty():
             self.fitInView(self.scene().sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self._zoom_changed()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
