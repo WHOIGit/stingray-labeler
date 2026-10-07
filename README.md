@@ -45,10 +45,10 @@ The executable is written to `dist/StingrayLabeler.exe`. GitHub Actions also bui
 
 ## Create and annotate a project
 
-1. Choose **File → New Project…** and select the folder containing the images. PNG, JPEG, TIFF, BMP, and WebP files are supported.
-2. To continue an existing project, choose **File → Open Project…**, select its image folder, and select the annotation JSON file if it is not found automatically.
-3. Add label names from **Labels → Add Label…**. Add more source images at any time with **File → Add Images…** or **File → Add Folder…**.
-4. Select an image and draw a box with **Draw box** or the **B** key. Assign a label in the side panel. Drag a box to move it, or drag a corner to resize it.
+1. Choose **File → New Project…** and select the folder containing the images. PNG, JPEG, TIFF, BMP, and WebP files are supported. Choose or enter your annotator name when prompted.
+2. To continue an existing project, choose **File → Open Project…**, select its image folder, and select the annotation JSON file if it is not found automatically. Choose an existing annotator or enter a new name when prompted. Use **Edit → Change Annotator…** to switch users during the session.
+3. Add label names from **Edit → Add Label…**. Add more source images at any time with **File → Add Images…** or **File → Add Folder…**.
+4. Select an image and draw a box with **Draw box** or the **B** key. Assign a label in the side panel. New or edited boxes are attributed to the active annotator. Use the **Annotator** frame filter to show frames containing that annotator’s boxes, or choose **Background / no annotations** for background frames.
 5. Mark reviewed images with **Image verified** and reviewed boxes with **Box verified**. For an image with no objects, select **Background (no annotations)**.
 6. Save the project with **File → Save Project**. The project stores annotation data alongside its image files.
 

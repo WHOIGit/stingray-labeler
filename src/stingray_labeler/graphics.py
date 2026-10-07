@@ -167,14 +167,14 @@ class BoxItem(QGraphicsRectItem):
             self._resize_handle = None
             self._undo_started = False
             if self._geometry_changed:
-                self.changed()
+                self.changed(self.annotation)
             self._geometry_changed = False
             event.accept()
             return
         self._undo_started = False
         super().mouseReleaseEvent(event)
         if self._geometry_changed:
-            self.changed()
+            self.changed(self.annotation)
         self._geometry_changed = False
 
     def itemChange(self, change, value):  # noqa: N802
