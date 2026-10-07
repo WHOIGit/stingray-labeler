@@ -665,16 +665,50 @@ class ImageAnnotator(QMainWindow):
         return {
             "info": {"description": "Created with Stingray Labeler"},
             "licenses": [], "images": [], "annotations": [], "categories": [],
+            "annotators": [],
         }
+
+    def _annotator_id(self, name: str) -> int:
+        annotators = self.annotation_data.setdefault("annotators", [])
+        for annotator in annotators:
+            if isinstance(annotator, dict) and annotator.get("name") == name:
+                return int(annotator["id"])
+        next_id = max(
+            (int(annotator.get("id", 0)) for annotator in annotators if isinstance(annotator, dict)),
+            default=0,
+        ) + 1
+        annotators.append({"id": next_id, "name": name})
+        return next_id
+
+    def _set_annotation_annotator(self, annotation: dict[str, Any]) -> None:
+        if self.current_annotator:
+            annotation["annotator_id"] = self._annotator_id(self.current_annotator)
+            annotation.pop("Annotator", None)
+
+    def _activate_annotator(self, name: str) -> None:
+        existing_names = {
+            annotator.get("name")
+            for annotator in self.annotation_data.get("annotators", [])
+            if isinstance(annotator, dict)
+        }
+        self.current_annotator = name
+        self._annotator_id(name)
+        self.change_annotator_action.setText(f"Change Annotator… ({name})")
+        self._refresh_annotator_filter(reset=True)
+        if name not in existing_names:
+            self.dirty = True
+            self.status_label.setText(f"Unsaved annotator record: {name}")
+        else:
+            self.status_label.setText(f"Active annotator: {name}")
 
     def _choose_annotator(
         self, annotation_data: dict[str, Any], *, include_current: bool = False,
     ) -> str | None:
         names = {
             value.strip()
-            for annotation in annotation_data.get("annotations", [])
-            if isinstance(annotation, dict)
-            and isinstance((value := annotation.get("Annotator")), str)
+            for annotator in annotation_data.get("annotators", [])
+            if isinstance(annotator, dict)
+            and isinstance((value := annotator.get("name")), str)
             and value.strip()
         }
         if include_current and self.current_annotator:
@@ -708,10 +742,7 @@ class ImageAnnotator(QMainWindow):
         value = self._choose_annotator(self.annotation_data, include_current=True)
         if value is None:
             return
-        self.current_annotator = value
-        self.change_annotator_action.setText(f"Change Annotator… ({value})")
-        self._refresh_annotator_filter()
-        self.status_label.setText(f"Active annotator: {value}")
+        self._activate_annotator(value)
 
     def _refresh_annotator_filter(self, *, reset: bool = False) -> None:
         if not hasattr(self, "annotator_filter"):
@@ -722,9 +753,9 @@ class ImageAnnotator(QMainWindow):
         )
         names = {
             value.strip()
-            for annotation in self.annotation_data.get("annotations", [])
-            if isinstance(annotation, dict)
-            and isinstance((value := annotation.get("Annotator")), str)
+            for annotator in self.annotation_data.get("annotators", [])
+            if isinstance(annotator, dict)
+            and isinstance((value := annotator.get("name")), str)
             and value.strip()
         }
         if self.current_annotator:
@@ -758,9 +789,7 @@ class ImageAnnotator(QMainWindow):
         if annotator is None:
             return
         self._set_dataset(root, annotation_data)
-        self.current_annotator = annotator
-        self.change_annotator_action.setText(f"Change Annotator… ({annotator})")
-        self._refresh_annotator_filter(reset=True)
+        self._activate_annotator(annotator)
         added, duplicates = self._add_source_images(paths, refresh=False)
         if duplicates:
             self._show_duplicate_summary(duplicates, added)
@@ -779,19 +808,13 @@ class ImageAnnotator(QMainWindow):
             return
         root = Path(folder).resolve()
         annotation_folder = root.parent
-        annotation_names = directory_names(annotation_folder)
-        annotations_file = (
-            annotation_folder / "annotations.json"
-            if "annotations.json" in annotation_names else None
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose annotations JSON (Cancel to start a new dataset)",
+            str(annotation_folder),
+            "JSON files (*.json)",
         )
-        if annotations_file is None:
-            selected, _ = QFileDialog.getOpenFileName(
-                self,
-                "Load annotations JSON (Cancel to start a new dataset)",
-                str(annotation_folder),
-                "JSON files (*.json)",
-            )
-            annotations_file = Path(selected).resolve() if selected else None
+        annotations_file = Path(selected).resolve() if selected else None
         if annotations_file is not None:
             try:
                 annotation_data = self._read_annotation_data(annotations_file)
@@ -799,9 +822,7 @@ class ImageAnnotator(QMainWindow):
                 if annotator is None:
                     return
                 self._set_dataset(root, annotation_data, annotations_file)
-                self.current_annotator = annotator
-                self.change_annotator_action.setText(f"Change Annotator… ({annotator})")
-                self._refresh_annotator_filter(reset=True)
+                self._activate_annotator(annotator)
             except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as error:
                 QMessageBox.critical(self, "Cannot open project", str(error))
             return
@@ -823,9 +844,7 @@ class ImageAnnotator(QMainWindow):
         if annotator is None:
             return
         self._set_dataset(root, annotation_data)
-        self.current_annotator = annotator
-        self.change_annotator_action.setText(f"Change Annotator… ({annotator})")
-        self._refresh_annotator_filter(reset=True)
+        self._activate_annotator(annotator)
         added, duplicates = self._add_source_images(paths, refresh=False)
         if duplicates:
             self._show_duplicate_summary(duplicates, added)
@@ -1168,8 +1187,15 @@ class ImageAnnotator(QMainWindow):
             elif annotator_filter == self.ALL_ANNOTATORS_FILTER_ID:
                 matches_annotator = True
             else:
+                annotator_ids = {
+                    annotator.get("name"): annotator.get("id")
+                    for annotator in self.annotation_data.get("annotators", [])
+                    if isinstance(annotator, dict)
+                }
+                annotator_id = annotator_ids.get(annotator_filter)
                 matches_annotator = any(
-                    annotation.get("Annotator") == annotator_filter
+                    annotation.get("annotator_id") == annotator_id
+                    or annotation.get("Annotator") == annotator_filter
                     for annotation in annotations
                 )
             if (
@@ -2046,7 +2072,7 @@ class ImageAnnotator(QMainWindow):
         self, annotation: dict[str, Any], *, counts_changed: bool = False,
     ) -> None:
         if self.current_annotator:
-            annotation["Annotator"] = self.current_annotator
+            self._set_annotation_annotator(annotation)
         self._mark_dirty(counts_changed=counts_changed)
         self._refresh_annotator_filter()
         self.refresh_frame_list(preserve_scene=True)
@@ -2387,7 +2413,7 @@ class ImageAnnotator(QMainWindow):
                 if annotation.get("category_id") == source_id:
                     annotation["category_id"] = target_id
                     if self.current_annotator:
-                        annotation["Annotator"] = self.current_annotator
+                        self._set_annotation_annotator(annotation)
         self.annotation_data["annotations"] = [
             annotation for image in self.images
             for annotation in self.annotations_by_image[image["id"]]
