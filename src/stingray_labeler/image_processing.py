@@ -17,6 +17,8 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 from PySide6.QtGui import QImage
 from PIL import Image
 
+from .avi import AviReader
+
 PREVIEW_MAX_SIDE = 2200
 
 
@@ -147,29 +149,42 @@ class PipelineSignals(QObject):
 
     image_loaded = Signal(object, object)  # image_id, LoadedImage
     image_failed = Signal(object, str)  # image_id, message
+    image_skipped = Signal(object)  # image_id; a video frame no longer wanted when its turn came
     preview_adjusted = Signal(int, object)  # generation, QImage | None
     detail_ready = Signal(int, object, int, int)  # generation, QImage, left, top
     levels_ready = Signal(int, int, int)  # generation, black, white
 
 
 class ImageLoadWorker(QRunnable):
-    """Decode an image and build its preview off the UI thread."""
+    """Decode an image, or read one video frame, and build its preview off the UI thread."""
 
-    def __init__(self, image_id, path: Path, signals: PipelineSignals):
+    def __init__(self, image_id, path: Path, signals: PipelineSignals,
+                 video: AviReader | None = None, frame: int = 0, still_wanted=None):
         super().__init__()
         self.image_id = image_id
         self.path = path
         self.signals = signals
+        self.video = video
+        self.frame = frame
+        self.still_wanted = still_wanted
 
     def run(self) -> None:
+        # Holding an arrow key queues frames faster than they load; only the newest is read.
+        if self.still_wanted is not None and not self.still_wanted():
+            self.signals.image_skipped.emit(self.image_id)
+            return
         try:
-            with Image.open(self.path) as source:
-                full = source.convert("RGB")
+            if self.video is not None:
+                full = self.video.read_frame(self.frame).convert("RGB")
+            else:
+                with Image.open(self.path) as source:
+                    full = source.convert("RGB")
             full.load()
             preview, scale = make_preview(full)
             loaded = LoadedImage(full, preview, scale, preview.histogram(), to_qimage(preview))
         except Exception as error:  # noqa: BLE001 - reported to the user as a load failure
-            self.signals.image_failed.emit(self.image_id, f"Could not open image:\n{self.path}\n\n{error}")
+            what = f"frame {self.frame} of video" if self.video is not None else "image"
+            self.signals.image_failed.emit(self.image_id, f"Could not open {what}:\n{self.path}\n\n{error}")
             return
         self.signals.image_loaded.emit(self.image_id, loaded)
 

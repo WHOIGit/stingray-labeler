@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stingray-labeler"
-version = "0.1.2"
+version = "0.1.3"
 description = "Lightweight local COCO image annotation tool for the Stingray custom tow sled"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,4 +27,4 @@ stingray-labeler-gui = "stingray_labeler.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-stingray_labeler = ["assets/*.png", "assets/*.ico"]
+stingray_labeler = ["assets/*.png", "assets/*.ico", "assets/*.md"]

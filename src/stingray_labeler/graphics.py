@@ -446,6 +446,7 @@ class AnnotationView(QGraphicsView):
     def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
         self.draw_mode = False
+        self.reference_lines = True  # cursor-following horizontal and vertical lines while drawing
         self.calibration_mode = False
         self._space_pressed = False
         self._pan_last: QPoint | None = None
@@ -473,6 +474,10 @@ class AnnotationView(QGraphicsView):
         if not enabled:
             self.clear_drawing_guides()
 
+    def set_reference_lines(self, enabled: bool) -> None:
+        self.reference_lines = enabled
+        self.viewport().update()
+
     def set_calibration_mode(self, enabled: bool) -> None:
         self.calibration_mode = enabled
         if not enabled:
@@ -481,9 +486,8 @@ class AnnotationView(QGraphicsView):
         self.calibrationModeChanged.emit(enabled)
 
     def _create_rubber_band(self, rect: QRectF) -> QGraphicsRectItem:
-        rubber_band = ClippedRubberBandItem(
-            rect, QPen(self.draw_color, 2.0, Qt.PenStyle.DashLine)
-        )
+        rubber_band = ClippedRubberBandItem(rect)  # the second constructor argument is a parent item
+        rubber_band.setPen(QPen(self.draw_color, 2.0, Qt.PenStyle.DashLine))
         rubber_band.setZValue(20)
         self.scene().addItem(rubber_band)
         return rubber_band
@@ -529,7 +533,7 @@ class AnnotationView(QGraphicsView):
         ]
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
-        if not self.draw_mode or self._crosshair_pos is None:
+        if not self.draw_mode or not self.reference_lines or self._crosshair_pos is None:
             return
         pen = QPen(QColor(0, 0, 0), 1.5)
         pen.setCosmetic(True)

@@ -13,7 +13,20 @@ analysis = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # The app only uses QtCore, QtGui and QtWidgets; keep the rest of PySide6 out of the bundle.
+    excludes=[
+        f"PySide6.{module}" for module in (
+            "Qt3DAnimation", "Qt3DCore", "Qt3DExtras", "Qt3DInput", "Qt3DLogic", "Qt3DRender",
+            "QtBluetooth", "QtCharts", "QtConcurrent", "QtDataVisualization", "QtDesigner",
+            "QtGraphs", "QtHelp", "QtHttpServer", "QtLocation", "QtMultimedia",
+            "QtMultimediaWidgets", "QtNetworkAuth", "QtNfc", "QtOpenGL", "QtOpenGLWidgets",
+            "QtPdf", "QtPdfWidgets", "QtPositioning", "QtQml", "QtQuick", "QtQuick3D",
+            "QtQuickControls2", "QtQuickWidgets", "QtRemoteObjects", "QtScxml", "QtSensors",
+            "QtSerialBus", "QtSerialPort", "QtSpatialAudio", "QtSql", "QtStateMachine",
+            "QtTest", "QtTextToSpeech", "QtUiTools", "QtWebChannel", "QtWebEngineCore",
+            "QtWebEngineQuick", "QtWebEngineWidgets", "QtWebSockets", "QtXml",
+        )
+    ],
     noarchive=False,
     optimize=0,
 )
