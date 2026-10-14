@@ -42,9 +42,11 @@ jobs:
         run: |
           $releaseTag = $env:GITHUB_REF_NAME
           $exe = "dist/StingrayLabeler-$($releaseTag.Substring(1)).exe"
+          # The exe bundles Qt/PySide6 (LGPL-3.0): ship the licences and notices alongside it.
+          $files = @($exe, "LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/LGPL-3.0.txt", "licenses/GPL-3.0.txt")
           gh release view $releaseTag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $releaseTag $exe --clobber
+            gh release upload $releaseTag @files --clobber
           } else {
-            gh release create $releaseTag $exe --verify-tag --generate-notes --title "Stingray Labeler $releaseTag"
+            gh release create $releaseTag @files --verify-tag --generate-notes --title "Stingray Labeler $releaseTag"
           }

@@ -56,3 +56,9 @@ The full guide is in the app under **Help → User Guide** (F1), and in [src/sti
 7. **File → Export Training Dataset…** exports verified images and verified boxes for model training.
 
 Unsaved work is backed up every 5 minutes on this computer and offered for recovery if the app closes without saving.
+
+## License
+
+Stingray Labeler's source code is licensed under the MIT License, see [LICENSE](LICENSE).
+
+The Windows executable also contains Qt for Python (PySide6) and Qt, licensed under the LGPL-3.0, and other third-party software; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the license texts in [licenses/](licenses/). These files are attached to every GitHub Release.
