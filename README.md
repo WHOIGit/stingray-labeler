@@ -4,7 +4,7 @@ Stingray Labeler is a desktop application for reviewing images and creating boun
 
 ## Windows executable
 
-Download the latest Windows build from [GitHub Releases](https://github.com/anhph95/stingray-labeler/releases/latest). The executable can be run directly; Python does not need to be installed on the target computer.
+Download the latest Windows build from [GitHub Releases](https://github.com/WHOIGit/stingray-labeler/releases/latest). The executable can be run directly; Python does not need to be installed on the target computer.
 
 ## Install from source
 
