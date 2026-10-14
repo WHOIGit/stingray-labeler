@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import threading
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,7 @@ class HandleItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setAcceptHoverEvents(True)
-        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor if corner in ("nw", "se") else Qt.CursorShape.SizeBDiagCursor)
         self.setZValue(1)
         self.hide()
 
@@ -137,16 +138,22 @@ class BoxItem(QGraphicsRectItem):
             | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
         self.setAcceptHoverEvents(True)
-        self.setZValue(5)
-        self.handles = {"nw": HandleItem(self, "nw"), "se": HandleItem(self, "se")}
+        self.handles = {corner: HandleItem(self, corner) for corner in ("nw", "ne", "sw", "se")}
         self.update_handles()
 
     def color(self) -> QColor:
         category_id = self.annotation["category_id"]
-        return self.class_colors.get(
-            category_id,
-            QColor.fromHsv((int(category_id) * 137) % 360, 210, 235),
-        )
+        return self.class_colors.get(category_id) or self.default_color(category_id)
+
+    @staticmethod
+    def default_color(category_id: Any) -> QColor:
+        """A category's colour unless one was picked: spread around the hue circle by its id (numbers in order,
+        other ids, e.g. text from a COCO file made elsewhere, by a fixed checksum of the text)."""
+        try:
+            number = int(category_id)
+        except (TypeError, ValueError):
+            number = zlib.crc32(str(category_id).encode("utf-8"))
+        return QColor.fromHsv((number * 137) % 360, 210, 235)
 
     def _view_scale(self) -> float:
         scene = self.scene()
@@ -155,12 +162,15 @@ class BoxItem(QGraphicsRectItem):
 
     def update_handles(self) -> None:
         """Place and size handles for the current zoom; called on zoom, resize and selection."""
-        scale = max(self._view_scale(), 1e-9)
+        # Stacking: the selected box on top (its handles and body can always be grabbed, even under a larger
+        # box); otherwise smaller boxes above larger ones, so a box inside another can still be clicked.
         rect = self.rect()
+        self.setZValue(10.0 if self.isSelected() else 5.0 + 1.0 / (1.0 + max(rect.width() * rect.height(), 0.0)))
+        scale = max(self._view_scale(), 1e-9)
         on_screen = min(rect.width(), rect.height()) * scale
         radius = min(self.HANDLE_MAX_PX,
                      max(self.HANDLE_MIN_PX, on_screen * self.HANDLE_BOX_FRACTION))
-        corners = {"nw": rect.topLeft(), "se": rect.bottomRight()}
+        corners = {"nw": rect.topLeft(), "ne": rect.topRight(), "sw": rect.bottomLeft(), "se": rect.bottomRight()}
         for name, handle in self.handles.items():
             handle.set_radius(radius)
             handle.setPos(corners[name])
@@ -200,11 +210,13 @@ class BoxItem(QGraphicsRectItem):
             )
         point = self.mapFromScene(scene_pos)
         rect = QRectF(self.rect())
-        if corner == "nw":
+        if "w" in corner:
             rect.setLeft(min(point.x(), rect.right() - self.MIN_SIZE))
-            rect.setTop(min(point.y(), rect.bottom() - self.MIN_SIZE))
         else:
             rect.setRight(max(point.x(), rect.left() + self.MIN_SIZE))
+        if "n" in corner:
+            rect.setTop(min(point.y(), rect.bottom() - self.MIN_SIZE))
+        else:
             rect.setBottom(max(point.y(), rect.top() + self.MIN_SIZE))
         if rect != self.rect():
             self.setRect(rect)
@@ -288,7 +300,7 @@ class ScaleBarItem(QGraphicsItem):
         self.width = width
         self.height = height
         self.visible = True
-        self.pixel_resolution = 40.0
+        self.pixel_resolution = 0.0  # not calibrated: no bar
         self.length_mm = 10.0
         self.setZValue(2)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -330,7 +342,8 @@ class ScaleBarItem(QGraphicsItem):
 
 
 class ImageRuler(QWidget):
-    """Fixed display ruler whose tick spacing follows zoom and pixel resolution."""
+    """Fixed display ruler whose tick spacing follows zoom and pixel resolution; with no resolution
+    (not calibrated) it counts image pixels."""
 
     def __init__(self, view: "AnnotationView", orientation: Qt.Orientation,
                  resolution: float, parent=None):
@@ -368,18 +381,18 @@ class ImageRuler(QWidget):
             origin = ruler_origin.y()
             available = self.height() - origin
             zoom = abs(self.view.transform().m22())
-        if available <= 0 or self.resolution <= 0 or zoom <= 0:
+        if available <= 0 or zoom <= 0:
             return
-        px_per_mm = 1000.0 / self.resolution * abs(zoom)
-        if px_per_mm <= 0:
-            return
+        calibrated = self.resolution > 0
+        # Screen pixels per ruler unit: a millimetre when calibrated, an image pixel otherwise.
+        screen_per_unit = (1000.0 / self.resolution if calibrated else 1.0) * abs(zoom)
         nice_intervals = (
             interval * (10 ** exponent)
             for exponent in range(-3, 10)
             for interval in (1, 2, 5)
         )
-        interval_mm = next(interval for interval in nice_intervals if interval * px_per_mm >= 80)
-        major_spacing = interval_mm * px_per_mm
+        interval_units = next(interval for interval in nice_intervals if interval * screen_per_unit >= 80)
+        major_spacing = interval_units * screen_per_unit
         last_major = math.floor(available / major_spacing)
         subdivisions = 10 if major_spacing >= 120 else 5 if major_spacing >= 60 else 2
         font = painter.font()
@@ -396,15 +409,18 @@ class ImageRuler(QWidget):
             else:
                 painter.drawLine(edge, position, edge - tick_length, position)
             if major:
-                distance_mm = tick // subdivisions * interval_mm
-                if interval_mm >= 1000:
-                    label = f"{distance_mm / 1000:g}"
+                distance = tick // subdivisions * interval_units
+                if not calibrated:
+                    label = f"{distance:g}"
+                    unit = "px"
+                elif interval_units >= 1000:
+                    label = f"{distance / 1000:g}"
                     unit = "m"
-                elif interval_mm >= 10:
-                    label = f"{distance_mm / 10:g}"
+                elif interval_units >= 10:
+                    label = f"{distance / 10:g}"
                     unit = "cm"
                 else:
-                    label = f"{distance_mm:g}"
+                    label = f"{distance:g}"
                     unit = "mm"
                 if self.orientation == Qt.Orientation.Horizontal:
                     painter.drawText(position + 2, 11, label)
@@ -441,7 +457,9 @@ class AnnotationView(QGraphicsView):
 
     rectangleCreated = Signal(QRectF)
     calibrationLineCreated = Signal(float)
+    middleClicked = Signal()  # a middle-button click without dragging (a drag pans)
     calibrationModeChanged = Signal(bool)
+    contextMenuRequested = Signal(QPoint, QPoint)  # viewport position, global position
 
     def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
@@ -450,6 +468,7 @@ class AnnotationView(QGraphicsView):
         self.calibration_mode = False
         self._space_pressed = False
         self._pan_last: QPoint | None = None
+        self._middle_press: QPoint | None = None  # where a middle-button press started, until it is a drag
         self._draw_start: QPointF | None = None
         self._rubber_band: QGraphicsRectItem | None = None
         self._calibration_start: QPointF | None = None
@@ -468,6 +487,20 @@ class AnnotationView(QGraphicsView):
         self.viewport().setMouseTracking(True)
 
     viewChanged = Signal()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        # No menu in the middle of drawing, panning or measuring: it would swallow the mouse release.
+        if self._draw_start is None and self._pan_last is None and self._calibration_start is None:
+            self.contextMenuRequested.emit(event.pos(), event.globalPos())
+        event.accept()
+
+    def box_at(self, position) -> BoxItem | None:
+        """The topmost box under a view position, looking past outlines drawn over it."""
+        for item in self.items(position):
+            item = getattr(item, "box", item)  # a corner handle belongs to its box
+            if isinstance(item, BoxItem):
+                return item
+        return None
 
     def set_draw_mode(self, enabled: bool) -> None:
         self.draw_mode = enabled
@@ -579,15 +612,16 @@ class AnnotationView(QGraphicsView):
         if event.button() == Qt.MouseButton.MiddleButton or (
             self._space_pressed and event.button() == Qt.MouseButton.LeftButton
         ):
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._middle_press = event.position().toPoint()
             self._pan_last = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
-        item = self.itemAt(event.position().toPoint())
         if (
             not self.draw_mode
             and event.button() == Qt.MouseButton.LeftButton
-            and not isinstance(item, (BoxItem, HandleItem))
+            and self.box_at(event.position().toPoint()) is None
             and (self.horizontalScrollBar().maximum() > 0 or self.verticalScrollBar().maximum() > 0)
         ):
             self._pan_last = event.position().toPoint()
@@ -634,6 +668,11 @@ class AnnotationView(QGraphicsView):
         if self._pan_last is not None and event.button() in {
             Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton,
         }:
+            if event.button() == Qt.MouseButton.MiddleButton and self._middle_press is not None:
+                moved = (event.position().toPoint() - self._middle_press).manhattanLength()
+                self._middle_press = None
+                if moved <= QApplication.startDragDistance():
+                    self.middleClicked.emit()
             self._pan_last = None
             self.setCursor(Qt.CursorShape.OpenHandCursor if self._space_pressed else Qt.CursorShape.ArrowCursor)
             event.accept()

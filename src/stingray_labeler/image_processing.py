@@ -15,7 +15,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 from PySide6.QtGui import QImage
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .avi import AviReader
 
@@ -178,7 +178,8 @@ class ImageLoadWorker(QRunnable):
                 full = self.video.read_frame(self.frame).convert("RGB")
             else:
                 with Image.open(self.path) as source:
-                    full = source.convert("RGB")
+                    # Upright as the camera's EXIF orientation says, as viewers and training tools show it.
+                    full = ImageOps.exif_transpose(source).convert("RGB")
             full.load()
             preview, scale = make_preview(full)
             loaded = LoadedImage(full, preview, scale, preview.histogram(), to_qimage(preview))

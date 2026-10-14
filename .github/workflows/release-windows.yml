@@ -41,9 +41,10 @@ jobs:
         shell: pwsh
         run: |
           $releaseTag = $env:GITHUB_REF_NAME
+          $exe = "dist/StingrayLabeler-$($releaseTag.Substring(1)).exe"
           gh release view $releaseTag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $releaseTag "dist/StingrayLabeler.exe" --clobber
+            gh release upload $releaseTag $exe --clobber
           } else {
-            gh release create $releaseTag "dist/StingrayLabeler.exe" --verify-tag --generate-notes --title "Stingray Labeler $releaseTag"
+            gh release create $releaseTag $exe --verify-tag --generate-notes --title "Stingray Labeler $releaseTag"
           }

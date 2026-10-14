@@ -41,7 +41,7 @@ python -m pip install ".[build]"
 python -m PyInstaller --clean --noconfirm pyinstaller.spec
 ```
 
-The executable is written to `dist/StingrayLabeler.exe`. GitHub Actions also builds a Windows executable when a version tag is published.
+The executable is written to `dist/StingrayLabeler-<version>.exe`, with the version from `pyproject.toml` (e.g. `StingrayLabeler-0.1.3.exe`). GitHub Actions also builds a Windows executable when a version tag is published.
 
 ## Using the app
 

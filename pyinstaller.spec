@@ -1,8 +1,11 @@
 # Build the GUI executable from the installable package with bundled icon assets.
+import re
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 
 package_data = collect_data_files("stingray_labeler")
+# The executable is named with the app version from pyproject.toml, e.g. StingrayLabeler-0.1.3.exe.
+version = re.search(r'^version\s*=\s*"([^"]+)"', Path("pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1)
 
 analysis = Analysis(
     ["run_stingray_labeler.py"],
@@ -37,7 +40,7 @@ exe = EXE(
     analysis.binaries,
     analysis.datas,
     [],
-    name="StingrayLabeler",
+    name=f"StingrayLabeler-{version}",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
