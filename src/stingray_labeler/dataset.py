@@ -14,6 +14,14 @@ def is_verified(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
+def model_score(record: dict[str, Any]) -> float | None:
+    """A box's model score, or None for a box without one (drawn or changed by a person)."""
+    score = record.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    return float(score)
+
+
 def dataset_image_path(root: Path, file_name: str) -> Path:
     """Resolve an image name directly inside the selected image folder."""
     parts = [part for part in str(file_name).replace("\\", "/").split("/") if part]

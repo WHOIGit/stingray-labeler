@@ -51,9 +51,9 @@ The full guide is in the app under **Help → User Guide** (F1), and in [src/sti
 2. Add sources from the **File** menu: images, image folders, or uncompressed AVI videos. PNG, JPEG, TIFF, BMP and WebP images are supported.
 3. Draw boxes with **Draw box** or **B**; type a new category name when asked to create it. **V** verifies the selected box.
 4. Set each image's **State**: Unverified, Review or Verified (**Shift+V**, **C**). Editing an unverified image sets it to Review.
-5. **File → Save Project** (Ctrl+S) saves Verified and Review images with all their boxes and copies them into the project folder. Nothing is ever deleted from the project folder.
+5. **File → Save** (Ctrl+S) saves Verified and Review images with all their boxes and copies them into the project folder. Nothing is ever deleted from the project folder.
 6. Two people working on copies of a project can combine their work with **Merge** (offered at Save, or **File → Merge Project…**).
-7. **File → Export Training Dataset…** exports verified images and verified boxes for model training.
+7. **File → Export → Training Dataset…** exports verified images and verified boxes for model training.
 
 Unsaved work is backed up every 5 minutes on this computer and offered for recovery if the app closes without saving.
 

@@ -384,11 +384,18 @@ class ImageRuler(QWidget):
         if available <= 0 or zoom <= 0:
             return
         calibrated = self.resolution > 0
-        # Screen pixels per ruler unit: a millimetre when calibrated, an image pixel otherwise.
-        screen_per_unit = (1000.0 / self.resolution if calibrated else 1.0) * abs(zoom)
+        # One unit per image, whatever the zoom: chosen from the image's size (µm, mm, cm or m when calibrated,
+        # image pixels otherwise). Zooming changes only the tick spacing.
+        if calibrated:
+            image_mm = max(scene_rect.width(), scene_rect.height()) * self.resolution / 1000.0
+            unit, unit_mm = (("m", 1000.0) if image_mm >= 1000 else ("cm", 10.0) if image_mm >= 10
+                             else ("mm", 1.0) if image_mm >= 1 else ("µm", 0.001))
+            screen_per_unit = unit_mm * 1000.0 / self.resolution * abs(zoom)
+        else:
+            unit, screen_per_unit = "px", abs(zoom)
         nice_intervals = (
             interval * (10 ** exponent)
-            for exponent in range(-3, 10)
+            for exponent in range(-6, 10)
             for interval in (1, 2, 5)
         )
         interval_units = next(interval for interval in nice_intervals if interval * screen_per_unit >= 80)
@@ -409,19 +416,7 @@ class ImageRuler(QWidget):
             else:
                 painter.drawLine(edge, position, edge - tick_length, position)
             if major:
-                distance = tick // subdivisions * interval_units
-                if not calibrated:
-                    label = f"{distance:g}"
-                    unit = "px"
-                elif interval_units >= 1000:
-                    label = f"{distance / 1000:g}"
-                    unit = "m"
-                elif interval_units >= 10:
-                    label = f"{distance / 10:g}"
-                    unit = "cm"
-                else:
-                    label = f"{distance:g}"
-                    unit = "mm"
+                label = f"{round(tick // subdivisions * interval_units, 9):g}"  # in the image's unit
                 if self.orientation == Qt.Orientation.Horizontal:
                     painter.drawText(position + 2, 11, label)
                 else:

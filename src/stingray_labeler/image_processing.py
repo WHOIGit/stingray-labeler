@@ -47,6 +47,18 @@ class LoadedImage:
     preview_qimage: QImage
 
 
+def to_rgb(image: Image.Image) -> Image.Image:
+    """8-bit RGB for display and crops. A 16-bit or float image is stretched from its own lowest to highest
+    value, so it is not clipped to white; other modes convert as usual."""
+    if image.mode.startswith("I;16"):
+        image = image.convert("I")
+    if image.mode in ("I", "F"):
+        low, high = image.getextrema()
+        scale = 255 / (high - low) if high > low else 1.0
+        image = image.point(lambda value: value * scale - low * scale).convert("L")
+    return image.convert("RGB")
+
+
 def to_qimage(image: Image.Image) -> QImage:
     raw = image.tobytes("raw", "RGB")
     return QImage(raw, image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
@@ -179,7 +191,7 @@ class ImageLoadWorker(QRunnable):
             else:
                 with Image.open(self.path) as source:
                     # Upright as the camera's EXIF orientation says, as viewers and training tools show it.
-                    full = ImageOps.exif_transpose(source).convert("RGB")
+                    full = to_rgb(ImageOps.exif_transpose(source))
             full.load()
             preview, scale = make_preview(full)
             loaded = LoadedImage(full, preview, scale, preview.histogram(), to_qimage(preview))

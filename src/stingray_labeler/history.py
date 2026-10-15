@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from collections import Counter
 from typing import Any, Iterable
 
-from .dataset import is_verified
+from .dataset import is_verified, model_score
 from .merge import image_key
 
 # Box fields that only describe history; training exports leave them out.
@@ -112,14 +112,14 @@ def box_note(record: dict[str, Any]) -> str:
 
 
 def _content(record: dict[str, Any]) -> tuple:
-    """What a version is about: class, geometry (to 1/1000 pixel) and verification. A note alone is not
-    a new version."""
+    """What a version is about: class, geometry (to 1/1000 pixel), verification and model score, so the
+    score a model gave stays in history when verifying removes it. A note alone is not a new version."""
     bbox = tuple(round(float(value), 3) for value in record.get("bbox") or ())
-    return record.get("category_id"), bbox, is_verified(record.get("verified", True))
+    return record.get("category_id"), bbox, is_verified(record.get("verified", True)), model_score(record)
 
 
 def same_content(first: dict[str, Any], second: dict[str, Any]) -> bool:
-    """True when two versions have the same class, geometry and verification."""
+    """True when two versions have the same class, geometry, verification and model score."""
     return _content(first) == _content(second)
 
 
@@ -161,14 +161,27 @@ def _history_record(saved: dict[str, Any], image_id: Any, **changes: Any) -> dic
         "image_id": image_id, "category_id": saved.get("category_id"),
         "bbox": list(saved.get("bbox") or []), "verified": is_verified(saved.get("verified", True)),
     })
+    if saved.get("score") is not None:
+        record["score"] = saved["score"]  # as written, never rounded
     if box_note(saved):
         record["note"] = box_note(saved)
+    if not changes.get("deleted"):
+        # Fields from elsewhere (e.g. a segmentation or attributes in an opened COCO file) stay with the version
+        # they belong to; the COCO id and the area (worked out from the box) are not kept, nor a plain iscrowd 0.
+        for name, value in saved.items():
+            if name not in _VERSION_FIELDS and not (name == "iscrowd" and value == 0):
+                record[name] = value
     for name, value in changes.items():
         if value is None:
             record.pop(name, None)
         else:
             record[name] = value
     return record
+
+
+# Fields _history_record handles itself, or does not keep (id, area); any other field of a box is kept as it is.
+_VERSION_FIELDS = {"box_id", "rev", "time", "annotator_id", "image_id", "category_id", "bbox", "verified", "score",
+                   "note", "deleted", "id", "area"}
 
 
 def record_versions(
@@ -503,7 +516,7 @@ def compare_versions(data: dict[str, Any], before: str, after: str, before_exclu
 
     def count(kind: str, image_id: Any, category_id: Any, user_id: Any) -> None:
         by_category.setdefault(categories.get(category_id, f"category {category_id}"), Counter())[kind] += 1
-        by_user.setdefault(users.get(user_id, "Unassigned"), Counter())[kind] += 1
+        by_user.setdefault(users.get(user_id, "–"), Counter())[kind] += 1
         images.setdefault(image_id, Counter())[kind] += 1
 
     for image_id in boxes_before.keys() | boxes_after.keys():
@@ -531,10 +544,13 @@ def activity(data: dict[str, Any], start: str, end: str) -> list[dict[str, Any]]
     users = {user.get("id"): str(user.get("name")) for user in data.get("annotators", []) or [] if isinstance(user, dict)}
     rows: dict[tuple[str, str], Counter] = {}
 
-    def add(time: str, user_id: Any, kind: str) -> None:
+    def add(time: str, user_id: Any, kind: str, record: dict[str, Any] | None = None) -> None:
+        """Count one change; the user column is the user's name, "model" for a scored box no one changed,
+        or empty when no user is known."""
         day = time[:10]
         if time and start <= day <= end:
-            rows.setdefault((day, users.get(user_id, "Unassigned")), Counter())[kind] += 1
+            name = users.get(user_id) or ("model" if record is not None and model_score(record) is not None else "")
+            rows.setdefault((day, name), Counter())[kind] += 1
 
     chains: dict[tuple, list[dict[str, Any]]] = {}
     for records in (data.get("annotations", []), data.get("annotation_history") or []):
@@ -549,11 +565,11 @@ def activity(data: dict[str, Any], start: str, end: str) -> list[dict[str, Any]]
             if record.get("deleted"):
                 add(time, record.get("annotator_id"), "boxes_deleted")
             elif previous is None or previous.get("deleted"):
-                add(time, record.get("annotator_id"), "boxes_drawn" if previous is None else "boxes_restored")
+                add(time, record.get("annotator_id"), "boxes_drawn" if previous is None else "boxes_restored", record)
             else:
-                add(time, record.get("annotator_id"), "boxes_edited")
+                add(time, record.get("annotator_id"), "boxes_edited", record)
                 if is_verified(record.get("verified", True)) and not is_verified(previous.get("verified", True)):
-                    add(time, record.get("annotator_id"), "boxes_verified")
+                    add(time, record.get("annotator_id"), "boxes_verified", record)
             previous = record
     for entry in data.get("state_history") or []:  # earlier states: set at their own time, by their own user
         if isinstance(entry, dict) and entry.get("time"):

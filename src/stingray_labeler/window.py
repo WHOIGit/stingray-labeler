@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    from PySide6.QtCore import QDate, QEvent, QEventLoop, QFile, QObject, QPoint, QStandardPaths, QPointF, QRectF, QSize, Qt, QRunnable, QThreadPool, QTimer, Signal
+    from PySide6.QtCore import QDate, QEvent, QEventLoop, QFile, QKeyCombination, QObject, QPoint, QSettings, QStandardPaths, QPointF, QRectF, QSize, Qt, QRunnable, QThreadPool, QTimer, Signal
     from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -44,6 +45,7 @@ try:
         QGridLayout,
         QHBoxLayout,
         QInputDialog,
+        QKeySequenceEdit,
         QLabel,
         QLineEdit,
         QListWidget,
@@ -72,7 +74,7 @@ except ImportError as error:
     raise SystemExit("Install the GUI dependencies with: python -m pip install PySide6 Pillow") from error
 
 from .avi import AviInfo, AviReader, VideoFrameRef, read_avi_info
-from .dataset import is_verified, dataset_image_path, directory_names, path_key
+from .dataset import is_verified, dataset_image_path, directory_names, model_score, path_key
 from .history import (
     activity, as_of, canonical_time, changed_images_in, compact_history, compare_versions, is_box_id, new_box_id, normalize_box_ids, record_states,
     box_note, later_time, newest_time, record_versions, same_content, saved_boxes, utc_now,
@@ -86,11 +88,34 @@ from .graphics import (
 )
 from .image_processing import (
     Adjustments, AutoLevelsWorker, DetailWorker, ImageLoadWorker, LoadedImage, PipelineSignals,
-    PreviewAdjustmentWorker, apply_image_adjustments, auto_levels,
+    PreviewAdjustmentWorker, apply_image_adjustments, auto_levels, to_rgb,
 )
 
 AUTOSAVE_INTERVAL_MS = 5 * 60 * 1000
 FRAME_STATES = ("verified", "review", "unverified")
+# Single-key shortcuts, changed in Edit → Keyboard Shortcuts… and kept on this PC: (name, what it does, default).
+# Arrows, Home / End, Delete, Esc, Enter and Space stay as they are.
+SHORTCUTS = (
+    ("previous", "Previous image, or frame when a video is selected", "A"),
+    ("next", "Next image, or frame when a video is selected", "D"),
+    ("back_10", "Back 10 frames (video)", "Shift+A"),
+    ("forward_10", "Forward 10 frames (video)", "Shift+D"),
+    ("previous_unverified", "Previous image not Verified, or frame with work (video)", "Q"),
+    ("next_unverified", "Next image not Verified, or frame with work (video)", "E"),
+    ("previous_box", "Previous box in the image", "W"),
+    ("next_box", "Next box in the image", "S"),
+    ("draw", "Draw a box", "B"),
+    ("verify_box", "Verify / unverify the selected box", "V"),
+    ("change_category", "Change the selected box's category", "R"),
+    ("delete_box", "Delete the selected box", "X"),
+    ("image_verified", "Image: Verified ↔ Review", "Shift+V"),
+    ("image_review", "Image: Review ↔ Unverified", "C"),
+    ("favorite", "Mark / unmark the image as a favorite", "T"),
+    ("auto_levels", "Automatic black/white levels; again for the defaults", "F"),
+    ("reset_image", "Reset image settings", "Shift+F"),
+    ("go_to_frame", "Type a frame number (video)", "G"),
+)
+FIXED_KEYS = ("Left", "Right", "Up", "Down", "Home", "End", "Del", "Esc", "Return", "Enter", "Space", "Tab")
 
 
 class FrameListWidget(QListWidget):
@@ -239,8 +264,8 @@ class ImageAnnotator(QMainWindow):
         self._frame_names: dict[Any, str] = {}
         self._pair_ious_by_image: dict[Any, list[float]] = {}
         self._shown_ids: set[Any] = set()
-        self._user_name_by_id: dict[int, str] = {}
-        self._user_id_by_name: dict[str, int] = {}
+        self._user_name_by_id: dict[Any, str] = {}  # ids are numbers, or text in a file from another tool
+        self._user_id_by_name: dict[str, Any] = {}
         self._load_notes: list[str] = []
         # (modified time, size) of the project file when it was opened or last saved by this session.
         self._file_signature: tuple[int, int] | None = None
@@ -271,6 +296,7 @@ class ImageAnnotator(QMainWindow):
         self._update_window_title()
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "stingray_label_icon.png")))
         self.resize(1400, 900)
+        self._load_shortcuts()
         self._build_ui()
         signals = self.pipeline_signals
         signals.image_loaded.connect(self._image_loaded)
@@ -295,15 +321,15 @@ class ImageAnnotator(QMainWindow):
         self.new_project_action = QAction("New Project…", self)
         self.open_project_action = QAction("Open Project…", self)
         self.add_images_action = QAction("Add Images…", self)
-        self.add_folder_action = QAction("Add Folder…", self)
+        self.add_folder_action = QAction("Add Image Folder…", self)
         self.add_video_action = QAction("Add Video…", self)
         self.add_video_folder_action = QAction("Add Video Folder…", self)
-        self.save_project_action = QAction("Save Project", self)
+        self.save_project_action = QAction("Save", self)
         self.save_project_action.setShortcut(QKeySequence("Ctrl+S"))
         self.save_project_action.setToolTip(
             "Save the project JSON to its current file, or choose a file if it has not been saved yet"
         )
-        self.save_project_as_action = QAction("Save Project As…", self)
+        self.save_project_as_action = QAction("Save As…", self)
         self.save_project_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self.save_project_as_action.setToolTip("Choose a folder and file name for the project JSON")
         self.merge_project_action = QAction("Merge Project…", self)
@@ -311,14 +337,30 @@ class ImageAnnotator(QMainWindow):
             "Merge another saved copy of this project into your saved project; every box version is kept"
         )
         self.merge_project_action.setEnabled(False)
-        self.training_export_action = QAction("Export Training Dataset…", self)
+        # Every export in one submenu, named without the word "Export".
+        self.training_export_action = QAction("Training Dataset…", self)
         self.training_export_action.setToolTip(
             "Export verified images, verified boxes, and explicitly marked background images"
         )
-        self.save_image_action = QAction("Export Image…", self)
+        favorites_export_action = QAction("Favorites…", self)
+        favorites_export_action.setToolTip("Copy the favorite images, with a COCO JSON of their boxes, to a folder")
+        favorites_export_action.triggered.connect(self._export_favorites)
+        self.save_image_action = QAction("Image…", self)
         self.save_image_action.setToolTip("Save the displayed image with its boxes drawn on it")
-        self.save_rois_action = QAction("Export Crops…", self)
+        self.save_rois_action = QAction("Crops…", self)
         self.save_rois_action.setToolTip("Save boxes as separate images, filtered by image, status and class")
+        activity_action = QAction("Activity (CSV)…", self)
+        activity_action.setToolTip("Per day and user: boxes drawn, edited, verified, deleted and images set, as CSV")
+        activity_action.triggered.connect(self._export_activity)
+        export_menu = QMenu("Export", self)
+        export_menu.setToolTipsVisible(True)
+        export_menu.addAction(self.training_export_action)
+        export_menu.addAction(favorites_export_action)
+        export_menu.addSeparator()
+        export_menu.addAction(self.save_image_action)
+        export_menu.addAction(self.save_rois_action)
+        export_menu.addSeparator()
+        export_menu.addAction(activity_action)
         self.exit_action = QAction("Exit", self)
         self.add_images_action.setEnabled(False)
         self.add_folder_action.setEnabled(False)
@@ -327,19 +369,20 @@ class ImageAnnotator(QMainWindow):
         self.save_project_action.setEnabled(False)
         self.save_project_as_action.setEnabled(False)
         self.training_export_action.setEnabled(False)
-        # Grouped: the project, adding sources, exports, then Exit (merge and training export are in Data).
+        # Grouped: open, save, add sources, merge, export, then Exit.
         for group in (
-            (self.new_project_action, self.open_project_action, self.save_project_action,
-             self.save_project_as_action),
+            (self.new_project_action, self.open_project_action),
+            (self.save_project_action, self.save_project_as_action),
             (self.add_images_action, self.add_folder_action, self.add_video_action,
              self.add_video_folder_action),
-            (self.save_image_action, self.save_rois_action),
+            (self.merge_project_action,),
+            (export_menu,),
             (self.exit_action,),
         ):
             if file_menu.actions():
                 file_menu.addSeparator()
-            for action in group:
-                file_menu.addAction(action)
+            for entry in group:
+                file_menu.addMenu(entry) if isinstance(entry, QMenu) else file_menu.addAction(entry)
 
         edit_menu = self.menuBar().addMenu("&Edit")
         self.undo_action = QAction("Undo", self)
@@ -349,22 +392,29 @@ class ImageAnnotator(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
         edit_menu.addSeparator()
-        # K is handled with the other single-key shortcuts (eventFilter), so typing in a search box is not taken.
-        self.change_category_action = QAction("Change Category of Selected Box… (R)", self)
+        # Its key is handled with the other single-key shortcuts (eventFilter), so typing in a search box is not
+        # taken; the menus and tips that name keys are filled in by _show_shortcut_keys.
+        self.change_category_action = QAction("Change Category…", self)
         self.change_category_action.setEnabled(False)
         self.change_category_action.triggered.connect(self._change_category)
         edit_menu.addAction(self.change_category_action)
-        # Categories, Import Categories and Users are in the Data menu.
+        edit_menu.addSeparator()
         self.edit_labels_action = QAction("Categories…", self)
-        self.import_classes_action = QAction("Import Categories from JSON…", self)
+        self.import_classes_action = QAction("Import Categories…", self)
+        self.import_classes_action.setToolTip("Copy category names from another project or COCO JSON")
         self.edit_labels_action.setEnabled(False)
         self.import_classes_action.setEnabled(False)
         self.change_annotator_action = QAction("Change User…", self)
         self.change_annotator_action.setEnabled(False)
         self.edit_annotators_action = QAction("Users…", self)
         self.edit_annotators_action.setEnabled(False)
-        self._edit_menu_tail = edit_menu.addSeparator()  # Find… goes in before it
+        edit_menu.addAction(self.edit_labels_action)
+        edit_menu.addAction(self.import_classes_action)
+        edit_menu.addAction(self.edit_annotators_action)
+        edit_menu.addSeparator()
         edit_menu.addAction(self.change_annotator_action)
+        self._edit_menu_tail = edit_menu.addSeparator()  # Find… goes in before it
+        edit_menu.addAction("Keyboard Shortcuts…").triggered.connect(self._edit_shortcuts)
 
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -399,18 +449,12 @@ class ImageAnnotator(QMainWindow):
         frame_row.addWidget(self.frame_slider, 1)
         self.frame_back_button = QToolButton()
         self.frame_back_button.setArrowType(Qt.ArrowType.LeftArrow)
-        self.frame_back_button.setToolTip("Previous frame (A)")
         self.frame_box = FrameNumberBox()
         self.frame_box.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.frame_box.setKeyboardTracking(False)  # typing jumps only on Enter
         self.frame_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.frame_box.setToolTip(
-            "Type a frame number and press Enter (G). A/D: ±1 frame, Shift+A/D: ±10, "
-            "Home/End: first/last, Q/E: previous/next frame with work, Esc: back to the image"
-        )
         self.frame_forward_button = QToolButton()
         self.frame_forward_button.setArrowType(Qt.ArrowType.RightArrow)
-        self.frame_forward_button.setToolTip("Next frame (D)")
         for button in (self.frame_back_button, self.frame_forward_button):
             button.setAutoRepeat(True)  # hold to keep stepping
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -583,51 +627,32 @@ class ImageAnnotator(QMainWindow):
         self.levels_menu = QMenu("Image", self)
         levels_widget = QWidget()
         levels_layout = QVBoxLayout(levels_widget)
-        brightness_row = QHBoxLayout()
-        brightness_row.addWidget(QLabel("Brightness"))
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(0, 300)
-        self.brightness_slider.setValue(100)
-        self.brightness_value = QLabel("100%")
-        brightness_row.addWidget(self.brightness_slider, 1)
-        brightness_row.addWidget(self.brightness_value)
-        levels_layout.addLayout(brightness_row)
-        contrast_row = QHBoxLayout()
-        contrast_row.addWidget(QLabel("Contrast"))
-        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
-        self.contrast_slider.setRange(0, 300)
-        self.contrast_slider.setValue(100)
-        self.contrast_value = QLabel("100%")
-        contrast_row.addWidget(self.contrast_slider, 1)
-        contrast_row.addWidget(self.contrast_value)
-        levels_layout.addLayout(contrast_row)
-        gamma_row = QHBoxLayout()
-        gamma_row.addWidget(QLabel("Gamma"))
-        self.gamma_slider = QSlider(Qt.Orientation.Horizontal)
-        self.gamma_slider.setRange(25, 400)
-        self.gamma_slider.setValue(100)
-        self.gamma_value = QLabel("1.00")
-        gamma_row.addWidget(self.gamma_slider, 1)
-        gamma_row.addWidget(self.gamma_value)
-        levels_layout.addLayout(gamma_row)
-        levels_layout.addWidget(QLabel("Black / white points"))
-        black_white_row = QHBoxLayout()
-        self.black_point = QSpinBox()
-        self.black_point.setRange(0, 254)
-        self.black_point.setPrefix("Black ")
-        self.black_point.setValue(0)
-        self.white_point = QSpinBox()
-        self.white_point.setRange(1, 255)
-        self.white_point.setPrefix("White ")
-        self.white_point.setValue(255)
-        black_white_row.addWidget(self.black_point)
-        black_white_row.addWidget(self.white_point)
-        levels_layout.addLayout(black_white_row)
+        # One slider per row, in a grid so labels, sliders and values line up; the value shows beside it.
+        slider_grid = QGridLayout()
+        slider_grid.setColumnStretch(1, 1)
+        for row, (name, label, low, high, value, text) in enumerate((
+            ("brightness_slider", "Brightness", 0, 300, 100, "100%"),
+            ("contrast_slider", "Contrast", 0, 300, 100, "100%"),
+            ("gamma_slider", "Gamma", 25, 400, 100, "1.00"),
+            ("black_point", "Black", 0, 254, 0, "0"),
+            ("white_point", "White", 1, 255, 255, "255"),
+        )):
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(low, high)
+            slider.setValue(value)
+            shown = QLabel(text)
+            shown.setMinimumWidth(QLabel("300%").sizeHint().width())
+            shown.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            slider_grid.addWidget(QLabel(label), row, 0)
+            slider_grid.addWidget(slider, row, 1)
+            slider_grid.addWidget(shown, row, 2)
+            setattr(self, name, slider)
+            if name in ("black_point", "white_point"):
+                slider.valueChanged.connect(lambda number, shown=shown: shown.setText(str(number)))
+            else:
+                setattr(self, name.replace("_slider", "_value"), shown)
+        levels_layout.addLayout(slider_grid)
         self.auto_levels_button = QPushButton("Auto levels for this image")
-        self.auto_levels_button.setToolTip(
-            "Estimate black and white points from this image only when requested. "
-            "F sets them; press F again to go back to the default levels."
-        )
         levels_layout.addWidget(self.auto_levels_button)
         self.invert_check = QCheckBox("Invert")
         levels_layout.addWidget(self.invert_check)
@@ -635,18 +660,20 @@ class ImageAnnotator(QMainWindow):
         levels_action = QWidgetAction(self.levels_menu)
         levels_action.setDefaultWidget(levels_widget)
         self.levels_menu.addAction(levels_action)
-        self.reset_image_action = QAction("Reset image settings	Shift+F", self)
+        self.reset_image_action = QAction("Reset Image", self)
         self.levels_menu.addAction(self.reset_image_action)
         display_menu = self.menuBar().addMenu("&View")
         display_menu.addMenu(self.levels_menu)
         display_menu.addMenu(self.scale_menu)
-        self.reference_lines_action = QAction("Reference lines while drawing", self)
+        display_menu.addSeparator()
+        self.reference_lines_action = QAction("Reference Lines", self)
         self.reference_lines_action.setCheckable(True)
         self.reference_lines_action.setChecked(True)
         self.reference_lines_action.setToolTip("Horizontal and vertical lines through the cursor while drawing a box")
         self.reference_lines_action.toggled.connect(self.view.set_reference_lines)
         display_menu.addAction(self.reference_lines_action)
-        self.selection_color_action = QAction("Selected box outline color…", self)
+        self.selection_color_action = QAction("Selection Color…", self)
+        self.selection_color_action.setToolTip("Outline color of the selected box")
         self.selection_color_action.triggered.connect(self._choose_selection_color)
         display_menu.addAction(self.selection_color_action)
 
@@ -711,13 +738,8 @@ class ImageAnnotator(QMainWindow):
         state_row.addWidget(QLabel("State:"))
         self.state_group = QButtonGroup(self)
         self.state_buttons: dict[str, QRadioButton] = {}
-        for state, label, tooltip in (
-            ("unverified", "Unverified", "Not reviewed. Not saved unless the project already holds work on it."),
-            ("review", "Review", "Worth another look (C). Set automatically on the first edit of an unverified image."),
-            ("verified", "Verified", "Confident in the boxes (Shift+V). Needs every box verified, or a background mark."),
-        ):
+        for state, label in (("unverified", "Unverified"), ("review", "Review"), ("verified", "Verified")):
             button = QRadioButton(label)
-            button.setToolTip(tooltip)
             button.setEnabled(False)
             self.state_group.addButton(button)
             self.state_buttons[state] = button
@@ -727,8 +749,12 @@ class ImageAnnotator(QMainWindow):
         annotation_layout.addWidget(QLabel("Add / edit box"))
         self.draw_button = QPushButton("Draw box")
         self.draw_button.setCheckable(True)
-        self.draw_button.setToolTip("Draw a box (B); press Esc to cancel")
-        annotation_layout.addWidget(self.draw_button)
+        self.repeat_category_check = QCheckBox("Repeat last category")
+        draw_row = QHBoxLayout()  # one line, so the box list keeps its height
+        draw_row.addWidget(self.draw_button)
+        draw_row.addWidget(self.repeat_category_check)
+        draw_row.addStretch(1)
+        annotation_layout.addLayout(draw_row)
         self.background_check = QCheckBox("Background")
         self.background_check.setToolTip("The image has no objects; can be ticked only when it has no boxes")
         self.background_check.setEnabled(False)
@@ -739,14 +765,19 @@ class ImageAnnotator(QMainWindow):
             combo.setMinimumContentsLength(8)
         self.edit_status = QCheckBox("Box verified")
         self.edit_status.setEnabled(False)
-        self.edit_status.setToolTip("Toggle verification for the selected box (V)")
         annotation_layout.addWidget(self.edit_status)
-        annotation_layout.addWidget(QLabel("Annotations in image"))
+        annotation_layout.addWidget(QLabel("Boxes"))
         self.annotation_search = QLineEdit()
         self.annotation_search.setPlaceholderText("Search boxes by category…")
         self.annotation_search.setClearButtonEnabled(True)
         self.annotation_search.setToolTip("Show only boxes whose current category contains this text")
         annotation_layout.addWidget(self.annotation_search)
+        # Names the fields of each box row, in order; only the fields this image's boxes have.
+        self.box_list_header = QLabel()
+        self.box_list_header.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        self.box_list_header.setToolTip("✓: verified · Ver: saved versions · IoU: highest overlap with another box")
+        self.box_list_header.hide()
+        annotation_layout.addWidget(self.box_list_header)
         self.annotation_list = QListWidget()
         annotation_layout.addWidget(self.annotation_list, 1)
         self.status_label = QLabel()
@@ -884,14 +915,13 @@ class ImageAnnotator(QMainWindow):
         filter_menu.addAction(self.changed_since_action)
         self.favorites_only_action = QAction("Favorites Only", self)
         self.favorites_only_action.setCheckable(True)
-        self.favorites_only_action.setToolTip("List only images marked as favorites (T)")
         self.favorites_only_action.toggled.connect(lambda _checked: self._apply_frame_filters())
         filter_menu.addAction(self.favorites_only_action)
         filter_menu.addSeparator()
         filter_menu.addAction("Clear Filters").triggered.connect(self._clear_filters)
-        favorites_export_action = data_menu.addAction("Export Favorites…")
-        favorites_export_action.setToolTip("Copy the favorite images, with a COCO JSON of their boxes, to a folder")
-        favorites_export_action.triggered.connect(self._export_favorites)
+        # Grouped: looking at the data, then data versions, then history upkeep. Categories, users, merge and
+        # exports are in Edit and File.
+        data_menu.setToolTipsVisible(True)
         summary_action = data_menu.addAction("Summary…")
         summary_action.setToolTip("Images, boxes, categories and users in numbers")
         summary_action.triggered.connect(self._show_summary)
@@ -902,17 +932,10 @@ class ImageAnnotator(QMainWindow):
             action.setToolTip(f"Set every image in the list, as currently filtered, to {state.capitalize()}")
             action.triggered.connect(lambda _checked=False, state=state: self._set_listed_frame_state(state))
         data_menu.addSeparator()
-        data_menu.addAction(self.edit_labels_action)
-        data_menu.addAction(self.import_classes_action)
-        data_menu.addAction(self.edit_annotators_action)
-        data_menu.addSeparator()
-        data_menu.addAction(self.merge_project_action)
-        data_menu.addAction(self.training_export_action)
-        data_menu.addSeparator()
         versions_action = data_menu.addAction("Data Versions…")
         versions_action.setToolTip("Name points in time to export the dataset as it was, or to revert to")
         versions_action.triggered.connect(self._edit_dataset_versions)
-        revert_action = data_menu.addAction("Show a Data Version…")
+        revert_action = data_menu.addAction("Show Data Version…")
         revert_action.setToolTip("Show the boxes as they were at a data version (read-only; nothing is edited)")
         revert_action.triggered.connect(self._revert_to)
         self.restore_version_action = data_menu.addAction("Restore This Version…")
@@ -923,9 +946,6 @@ class ImageAnnotator(QMainWindow):
         compare_action = data_menu.addAction("Compare Data Versions…")
         compare_action.setToolTip("Boxes added, deleted and changed between two data versions")
         compare_action.triggered.connect(self._compare_versions)
-        activity_action = data_menu.addAction("Export Activity (CSV)…")
-        activity_action.setToolTip("Per day and user: boxes drawn, edited, verified, deleted and images set, as CSV")
-        activity_action.triggered.connect(self._export_activity)
         data_menu.addSeparator()
         compact_action = data_menu.addAction("Compact History…")
         compact_action.setToolTip("Keep only the newest of a user's back-to-back versions of their own box")
@@ -933,18 +953,21 @@ class ImageAnnotator(QMainWindow):
 
         # Keys are handled in eventFilter (so typing in a search box is not taken); the menu lists them.
         go_menu = self.menuBar().addMenu("&Navigation")
+        self._navigation_actions: dict[str, tuple[QAction, str]] = {}
         for group in (
-            (("Previous Image\tA", lambda: self._navigate_frames(-1)),
-             ("Next Image\tD", lambda: self._navigate_frames(1)),
-             ("Previous Unverified Image\tQ", lambda: self._jump_to_unverified(-1)),
-             ("Next Unverified Image\tE", lambda: self._jump_to_unverified(1))),
-            (("Previous Box\tW", lambda: self._step_box(-1)),
-             ("Next Box\tS", lambda: self._step_box(1))),
+            (("previous", "Previous Image", lambda: self._navigate_frames(-1)),
+             ("next", "Next Image", lambda: self._navigate_frames(1)),
+             ("previous_unverified", "Previous Unverified Image", lambda: self._jump_to_unverified(-1)),
+             ("next_unverified", "Next Unverified Image", lambda: self._jump_to_unverified(1))),
+            (("previous_box", "Previous Box", lambda: self._step_box(-1)),
+             ("next_box", "Next Box", lambda: self._step_box(1))),
         ):
             if go_menu.actions():
                 go_menu.addSeparator()
-            for text, slot in group:
-                go_menu.addAction(text).triggered.connect(slot)
+            for name, text, slot in group:
+                action = go_menu.addAction(text)
+                action.triggered.connect(slot)
+                self._navigation_actions[name] = (action, text)  # named with its key by _show_shortcut_keys
 
         help_menu = self.menuBar().addMenu("&Help")
         self.user_guide_action = QAction("User Guide", self)
@@ -976,6 +999,7 @@ class ImageAnnotator(QMainWindow):
             (self.reference_lines_action, ["Ctrl+R"]),
         ):
             action.setShortcuts([QKeySequence(key) for key in keys])
+        self._show_shortcut_keys()
 
     def _show_user_guide(self) -> None:
         """Show the user guide (assets/user_guide.md) in a window that can stay open while working."""
@@ -1581,11 +1605,23 @@ class ImageAnnotator(QMainWindow):
     def _rebuild_user_cache(self) -> None:
         """Refresh the id <-> name lookups; only needed when users are loaded, added, renamed or merged."""
         self._user_name_by_id = {
-            int(user["id"]): str(user.get("name", ""))
+            self._user_key(user["id"]): str(user.get("name", ""))
             for user in self.annotation_data.get("annotators", [])
             if isinstance(user, dict) and "id" in user
         }
         self._user_id_by_name = {name: user_id for user_id, name in self._user_name_by_id.items()}
+
+    @staticmethod
+    def _user_key(value: Any) -> Any:
+        """A user id as one key: a number when it reads as one (3, "3", 3.0), otherwise the text itself."""
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return value.strip()
+        return value
 
     def _remap_user(self, old_id: Any, new_id: Any) -> None:
         """Remember that boxes saved under ``old_id`` are now credited to ``new_id`` (None: unassigned)."""
@@ -1632,11 +1668,11 @@ class ImageAnnotator(QMainWindow):
             annotation["annotator_id"] = self._annotator_id(self.current_annotator)
 
     def _annotation_user_name(self, annotation: dict[str, Any]) -> str:
-        try:
-            user_id = int(annotation.get("annotator_id"))
-        except (TypeError, ValueError):
-            return "Unassigned"
-        return self._user_name_by_id.get(user_id, "Unassigned")
+        """Who a box is credited to: its user; "model" for a box with a model score and no user; "–" otherwise."""
+        user_id = self._user_key(annotation.get("annotator_id"))
+        if isinstance(user_id, (int, str)) and user_id in self._user_name_by_id:
+            return self._user_name_by_id[user_id]
+        return "model" if self._model_score(annotation) is not None else "–"
 
     def _editing_allowed(self) -> bool:
         """Project changes are read-only until a user is chosen, and while a data version is shown."""
@@ -1703,6 +1739,7 @@ class ImageAnnotator(QMainWindow):
         layout.addWidget(QLabel("Choose an existing user or enter a new name:"))
         name_input = QComboBox(dialog)
         name_input.setEditable(True)
+        name_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)  # Enter never adds a name to the list
         name_input.addItems(choices)
         if self.current_annotator:
             name_input.setCurrentText(self.current_annotator)
@@ -1713,18 +1750,24 @@ class ImageAnnotator(QMainWindow):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             parent=dialog,
         )
-        buttons.accepted.connect(dialog.accept)
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+        def name_typed(text: str) -> None:
+            ok_button.setEnabled(bool(text.strip()))  # OK and Enter do nothing until a name is there
+
+        def accept() -> None:
+            if name_input.currentText().strip():
+                dialog.accept()
+
+        name_input.currentTextChanged.connect(name_typed)
+        name_typed(name_input.currentText())
+        buttons.accepted.connect(accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         dialog.setMinimumWidth(360)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         value = name_input.currentText().strip()
-        if not value:
-            QMessageBox.information(
-                self, "User required", "Enter or select a user name."
-            )
-            return None
         value = next((name for name in choices if name.casefold() == value.casefold()), value)
         return value
 
@@ -1794,7 +1837,7 @@ class ImageAnnotator(QMainWindow):
         self._apply_frame_filters(select_first=False)
 
     def _edit_annotators(self) -> None:
-        """Data → Users…: add, rename, merge (rename to an existing name) and delete users. Changes are
+        """Edit → Users…: add, rename, merge (rename to an existing name) and delete users. Changes are
         listed in the dialog and applied together with Save; Cancel leaves the project as it was."""
         if not self._editing_allowed():
             return
@@ -2657,10 +2700,10 @@ class ImageAnnotator(QMainWindow):
             annotator["name"] = annotator["name"].strip()
             if not annotator["name"]:
                 raise ValueError("Each user must have an id and a non-empty name")
-            try:
-                annotator["id"] = int(annotator["id"])
-            except (TypeError, ValueError):
-                raise ValueError("Each user id must be an integer") from None
+            annotator["id"] = self._user_key(annotator["id"])
+            if not isinstance(annotator["id"], (int, str)) or isinstance(annotator["id"], bool) or (
+                    isinstance(annotator["id"], str) and not annotator["id"].strip()):
+                raise ValueError("Each user id must be a number or a non-empty text")
             if annotator["id"] in annotator_ids:
                 raise ValueError("User IDs must be unique")
             annotator_ids.add(annotator["id"])
@@ -3015,6 +3058,7 @@ class ImageAnnotator(QMainWindow):
     def _add_frame_row(self, image_id: Any) -> QListWidgetItem:
         """Insert a row for a video frame that just got work, in sorted place, without moving the list."""
         image = self.image_by_id[image_id]
+        image_name = image["file_name"].replace("\\", "/").rsplit("/", 1)[-1]
         key = self._frame_sort_key(image)
         low, high = 0, self.frame_list.count()
         while low < high:
@@ -3062,15 +3106,16 @@ class ImageAnnotator(QMainWindow):
 
     def _score_filter_changed(self, _index: int) -> None:
         self.score_filter_threshold.setEnabled(self._score_filter_on())
+        if self._score_filter_on():  # 0–1, widened to the project's scores when a model's go beyond it
+            scores = [score for annotation in self._all_annotations()
+                      if (score := self._model_score(annotation)) is not None]
+            self.score_filter_threshold.setRange(min([0.0, *scores]), max([1.0, *scores]))
         self._apply_frame_filters()
 
     @staticmethod
     def _model_score(annotation: dict[str, Any]) -> float | None:
         """A box's model score, or None for a manual box."""
-        score = annotation.get("score")
-        if isinstance(score, bool) or not isinstance(score, (int, float)):
-            return None
-        return float(score)
+        return model_score(annotation)
 
     def _frame_filter_context(self) -> dict[str, Any]:
         """Read the filter widgets once, so each row check is plain dictionary work."""
@@ -3380,10 +3425,10 @@ class ImageAnnotator(QMainWindow):
         shown_count, shown_states, total_states = totals["shown"], totals["shown_states"], totals["listed"]
         verified_filtered, unverified_filtered = totals["verified"], totals["unverified"]
         if self._frame_items and not shown_count:
-            self.frame_stats.setText(f"No images match these filters (0 / {len(self._frame_items):,})")
+            self.frame_stats.setText(f"0/{len(self._frame_items):,} images match")
         else:
             self.frame_stats.setText(
-                f"{shown_count:,} / {len(self._frame_items):,} images · "
+                f"{shown_count:,}/{len(self._frame_items):,} images · "
                 f"{shown_states['verified']:,} verified · {shown_states['review']:,} review · "
                 f"{verified_filtered + unverified_filtered:,} boxes"
             )
@@ -3422,17 +3467,19 @@ class ImageAnnotator(QMainWindow):
         position = bisect.bisect_left(self._shown_rows, row) if row is not None else len(self._shown_rows)
         shown = position < len(self._shown_rows) and self._shown_rows[position] == row
         self.image_info.setText(
-            f"Image {position + 1 if shown else '–'}/{len(self._shown_rows):,}"
-            + ("  ★" if image.get("favorite") else "") + "  |  "
-            f"Dim: {width:,} × {height:,} px  |  Size: {self._image_size_text(image)}  |  "
-            f"Boxes: {len(self.current_items)} ({verified} verified, {unverified} unverified)"
+            f"{position + 1 if shown else '–'}/{len(self._shown_rows):,}" + (" ★" if image.get("favorite") else "")
+            + f" · {width:,}×{height:,} px · {self._image_size_text(image)}"
+            + f" · {len(self.current_items)} box{'' if len(self.current_items) == 1 else 'es'}"
+            + (f" ({verified} ✓)" if self.current_items else "")
         )
+        self.image_info.setToolTip(f"Image {position + 1 if shown else '–'} of {len(self._shown_rows):,} listed · "
+                                   f"{verified} verified and {unverified} unverified box(es)")
 
     def _image_size_text(self, image: dict[str, Any]) -> str:
         """File size of the image's current source; looked up once per file (metadata only, nothing is read)."""
         source = self._image_source(image)
         if isinstance(source, VideoFrameRef):
-            return f"{self._format_bytes(source.video.frame_bytes)} (raw video frame)"
+            return f"{self._format_bytes(source.video.frame_bytes)} raw"
         if source is None:
             return "—"
         key = path_key(source)
@@ -3513,17 +3560,144 @@ class ImageAnnotator(QMainWindow):
             self._leave_video_mode()  # choosing an image puts the arrow keys back on the image list
             self._load_frame(current.data(Qt.ItemDataRole.UserRole))
 
+    # ---------- keyboard shortcuts ----------
+
+    def _load_shortcuts(self) -> None:
+        """The single-key shortcuts: the defaults, with the changes saved on this PC laid over them."""
+        self.shortcuts = {name: default for name, _what, default in SHORTCUTS}
+        try:
+            saved = json.loads(str(QSettings("StingrayLabeler", "StingrayLabeler").value("shortcuts", "{}")))
+        except ValueError:
+            saved = {}
+        if isinstance(saved, dict):
+            self.shortcuts.update({name: QKeySequence(keys).toString() for name, keys in saved.items()
+                                   if name in self.shortcuts and isinstance(keys, str)})
+        self._shortcut_names = {QKeySequence(keys).toString(): name for name, keys in self.shortcuts.items() if keys}
+
+    def _key(self, name: str) -> str:
+        """A shortcut's key as shown in menus and tips ("" when it has none)."""
+        return QKeySequence(self.shortcuts[name]).toString(QKeySequence.SequenceFormat.NativeText)
+
+    @staticmethod
+    def _event_keys(event) -> str:
+        """The key pressed, in the form shortcuts are kept in (keypad keys count as the plain keys)."""
+        combination = event.keyCombination()
+        modifiers = combination.keyboardModifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        return QKeySequence(QKeyCombination(modifiers, combination.key())).toString()
+
+    def _show_shortcut_keys(self) -> None:
+        """Name the current keys in the menus and tips that mention them."""
+        def tip(text: str, *names: str) -> str:
+            keys = " / ".join(key for key in (self._key(name) for name in names) if key)
+            return f"{text} ({keys})" if keys else text
+
+        def menu_text(text: str, name: str) -> str:
+            return f"{text}\t{self._key(name)}" if self._key(name) else text
+
+        self.change_category_action.setText(tip("Change Category of Selected Box…", "change_category"))
+        self.frame_back_button.setToolTip(tip("Previous frame", "previous"))
+        self.frame_forward_button.setToolTip(tip("Next frame", "next"))
+        self.frame_box.setToolTip(
+            tip("Type a frame number and press Enter", "go_to_frame") + ". "
+            + tip("±1 frame", "previous", "next") + ", " + tip("±10", "back_10", "forward_10") + ", "
+            "Home/End: first/last, " + tip("previous/next frame with work", "previous_unverified", "next_unverified")
+            + ", Esc: back to the image"
+        )
+        self.auto_levels_button.setToolTip(
+            tip("Estimate black and white points from this image only when requested; press again to go back "
+                "to the default levels", "auto_levels"))
+        self.reset_image_action.setText(menu_text("Reset Image", "reset_image"))
+        self.state_buttons["unverified"].setToolTip(
+            "Not reviewed. Saved when it holds boxes or other work; an empty one is left out.")
+        self.state_buttons["review"].setToolTip(
+            tip("Worth another look", "image_review") + ". Set automatically on the first edit of an unverified image.")
+        self.state_buttons["verified"].setToolTip(
+            tip("Confident in the boxes", "image_verified") + ". Needs every box verified, or a background mark.")
+        self.draw_button.setToolTip(tip("Draw a box", "draw") + "; press Esc to cancel")
+        self.repeat_category_check.setToolTip(
+            "New boxes get the category of the last box drawn, without asking"
+            + (f" ({self._key('change_category')} changes a box's category)" if self._key("change_category") else ""))
+        self.edit_status.setToolTip(tip("Toggle verification for the selected box", "verify_box"))
+        self.favorites_only_action.setToolTip(tip("List only images marked as favorites", "favorite"))
+        for name, (action, text) in self._navigation_actions.items():
+            action.setText(menu_text(text, name))
+
+    def _edit_shortcuts(self) -> None:
+        """Edit → Keyboard Shortcuts…: change the single-key shortcuts; kept on this PC, for every project."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Keyboard Shortcuts")
+        layout = QVBoxLayout(dialog)
+        note = QLabel("Click a key and press the new one. Shortcuts are kept on this PC. Arrows, Home / End, "
+                      "Delete, Esc, Enter and Space cannot be changed.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        table = QTableWidget(len(SHORTCUTS), 2)
+        table.setHorizontalHeaderLabels(["Action", "Key"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        editors: dict[str, QKeySequenceEdit] = {}
+        for row, (name, what, _default) in enumerate(SHORTCUTS):
+            table.setItem(row, 0, QTableWidgetItem(what))
+            editor = QKeySequenceEdit(QKeySequence(self.shortcuts[name]))
+            editor.setMaximumSequenceLength(1)
+            editor.setClearButtonEnabled(True)
+            table.setCellWidget(row, 1, editor)
+            editors[name] = editor
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+                                   | QDialogButtonBox.StandardButton.RestoreDefaults)
+
+        def restore_defaults() -> None:
+            for name, _what, default in SHORTCUTS:
+                editors[name].setKeySequence(QKeySequence(default))
+
+        def save() -> None:
+            chosen = {name: editor.keySequence().toString() for name, editor in editors.items()}
+            menu_keys = {sequence.toString() for action in self.findChildren(QAction) for sequence in action.shortcuts()}
+            what = {name: text for name, text, _default in SHORTCUTS}
+            used: dict[str, str] = {}
+            for name, keys in chosen.items():
+                if not keys:
+                    continue
+                if keys in FIXED_KEYS or keys in menu_keys:
+                    QMessageBox.information(dialog, "Keyboard Shortcuts",
+                                            f"{keys} is already used by the app; choose another key for "
+                                            f"“{what[name]}”.")
+                    return
+                if keys in used:
+                    QMessageBox.information(dialog, "Keyboard Shortcuts",
+                                            f"{keys} is set for both “{what[used[keys]]}” and “{what[name]}”.")
+                    return
+                used[keys] = name
+            changed = {name: keys for name, keys in chosen.items() if keys != QKeySequence(
+                next(default for other, _what, default in SHORTCUTS if other == name)).toString()}
+            QSettings("StingrayLabeler", "StingrayLabeler").setValue("shortcuts", json.dumps(changed))
+            self._load_shortcuts()
+            self._show_shortcut_keys()
+            dialog.accept()
+
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(restore_defaults)
+        buttons.accepted.connect(save)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(560, 600)
+        dialog.exec()
+
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        # F: automatic black/white levels for this image; again: back to the default levels.
-        if (event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and QApplication.activeWindow() is self
-                and event.key() == Qt.Key.Key_F
-                and not event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+        if (event.type() not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+                or QApplication.activeWindow() is not self):
+            return super().eventFilter(watched, event)
+        shortcut = self._shortcut_names.get(self._event_keys(event))
+        # Automatic black/white levels for this image; again: back to the default levels.
+        if (shortcut == "auto_levels"
                 and not isinstance(QApplication.focusWidget(),
-                                   (QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QSpinBox))):
+                                   (QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QSpinBox, QKeySequenceEdit))):
             if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
                 self._toggle_auto_levels()
             return True
-        if QApplication.activeWindow() is self and event.type() == QEvent.Type.KeyPress:
+        if event.type() == QEvent.Type.KeyPress:
             focus = QApplication.focusWidget()
 
             def focus_within(widget: QWidget) -> bool:
@@ -3541,43 +3715,59 @@ class ImageAnnotator(QMainWindow):
                     self.frame_box.blockSignals(False)
                     self.view.setFocus()
                     return True
-            if isinstance(focus, (QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QSpinBox)):
+            if isinstance(focus, (QLineEdit, QComboBox, QSlider, QDoubleSpinBox, QSpinBox, QKeySequenceEdit)):
                 return super().eventFilter(watched, event)
             in_annotation_ui = focus_within(self.centralWidget())
-            # Left hand on the keyboard, right hand on the mouse: A / D previous / next image (or frame),
-            # Q / E previous / next image not verified (or frame with work), W / S previous / next box.
-            if event.modifiers() == Qt.KeyboardModifier.NoModifier and in_annotation_ui:
-                key = event.key()
-                video = self._active_video is not None
-                if key in (Qt.Key.Key_A, Qt.Key.Key_D):
-                    step = -1 if key == Qt.Key.Key_A else 1
+            video = self._active_video is not None
+            # Left hand on the keyboard, right hand on the mouse; the keys are set in Edit → Keyboard Shortcuts….
+            if in_annotation_ui and shortcut is not None:
+                has_image = self.current_image_id in self.image_by_id
+                if shortcut in ("previous", "next"):
+                    step = -1 if shortcut == "previous" else 1
                     self._step_video_frame(step) if video else self._navigate_frames(step)
                     return True
-                if key in (Qt.Key.Key_Q, Qt.Key.Key_E):
-                    step = -1 if key == Qt.Key.Key_Q else 1
+                if shortcut in ("previous_unverified", "next_unverified"):
+                    step = -1 if shortcut == "previous_unverified" else 1
                     self._jump_to_video_work(step) if video else self._jump_to_unverified(step)
                     return True
-                if key in (Qt.Key.Key_W, Qt.Key.Key_S):
-                    self._step_box(-1 if key == Qt.Key.Key_W else 1)
+                if shortcut in ("previous_box", "next_box"):
+                    self._step_box(-1 if shortcut == "previous_box" else 1)
                     return True
-                if key == Qt.Key.Key_T:
+                if shortcut == "favorite":
                     self._toggle_favorite()
                     return True
-            if event.modifiers() == Qt.KeyboardModifier.ShiftModifier and in_annotation_ui:
-                if event.key() in (Qt.Key.Key_A, Qt.Key.Key_D) and self._active_video is not None:
-                    self._step_video_frame(-10 if event.key() == Qt.Key.Key_A else 10)
+                if shortcut in ("back_10", "forward_10") and video:
+                    self._step_video_frame(-10 if shortcut == "back_10" else 10)
                     return True
-                if event.key() == Qt.Key.Key_F:
+                if shortcut == "reset_image":
                     self._reset_image_view()
                     return True
-            if self._active_video is not None and self._video_key(event):
-                return True
-
-            if event.modifiers() == Qt.KeyboardModifier.ShiftModifier and event.key() == Qt.Key.Key_V:
-                if in_annotation_ui and self.current_image_id in self.image_by_id:
+                if shortcut == "image_verified" and has_image:
                     verified = self._frame_state(self.current_image_id) == "verified"
                     self._set_frame_state("review" if verified else "verified")
                     return True
+                if shortcut == "draw" and self.draw_button.isEnabled():
+                    self.draw_button.toggle()
+                    return True
+                if shortcut == "verify_box" and self.edit_status.isEnabled():
+                    self.edit_status.toggle()
+                    return True
+                if shortcut == "change_category" and self.change_category_action.isEnabled():
+                    self._change_category()
+                    return True
+                if shortcut == "image_review" and has_image:
+                    review = self._frame_state(self.current_image_id) == "review"
+                    self._set_frame_state("unverified" if review else "review")
+                    return True
+                if shortcut == "delete_box" and self._selected_item() is not None:
+                    self._delete_selected()
+                    return True
+            if video and shortcut == "go_to_frame":
+                self.frame_box.setFocus()
+                self.frame_box.selectAll()
+                return True
+            if video and self._video_key(event):
+                return True
             if event.modifiers() == Qt.KeyboardModifier.NoModifier:
                 if event.key() == Qt.Key.Key_Left:
                     self._navigate_frames(-1)
@@ -3585,31 +3775,16 @@ class ImageAnnotator(QMainWindow):
                 if event.key() == Qt.Key.Key_Right:
                     self._navigate_frames(1)
                     return True
-                if in_annotation_ui and event.key() == Qt.Key.Key_B and self.draw_button.isEnabled():
-                    self.draw_button.toggle()
-                    return True
-                if in_annotation_ui and event.key() == Qt.Key.Key_V and self.edit_status.isEnabled():
-                    self.edit_status.toggle()
-                    return True
-                if in_annotation_ui and event.key() == Qt.Key.Key_R and self.change_category_action.isEnabled():
-                    self._change_category()
-                    return True
-                if (in_annotation_ui and event.key() == Qt.Key.Key_C
-                        and self.current_image_id in self.image_by_id):
-                    review = self._frame_state(self.current_image_id) == "review"
-                    self._set_frame_state("unverified" if review else "review")
-                    return True
                 if in_annotation_ui and event.key() == Qt.Key.Key_Escape and self.draw_button.isChecked():
                     self.draw_button.setChecked(False)
                     return True
-                if (in_annotation_ui and event.key() in (Qt.Key.Key_X, Qt.Key.Key_Delete)
-                        and self._selected_item() is not None):
+                if in_annotation_ui and event.key() == Qt.Key.Key_Delete and self._selected_item() is not None:
                     self._delete_selected()
                     return True
         return super().eventFilter(watched, event)
 
     def _video_key(self, event) -> bool:
-        """Frame navigation while a video is selected; True when the key was used."""
+        """Fixed frame keys while a video is selected (arrows, Home / End); True when the key was used."""
         key, modifiers = event.key(), event.modifiers()
         if modifiers == Qt.KeyboardModifier.NoModifier:
             steps = {Qt.Key.Key_Left: -1, Qt.Key.Key_Right: 1}
@@ -3619,9 +3794,6 @@ class ImageAnnotator(QMainWindow):
                 self._show_video_frame(0)
             elif key == Qt.Key.Key_End:
                 self._show_video_frame(self._active_video.frame_count - 1)
-            elif key == Qt.Key.Key_G:
-                self.frame_box.setFocus()
-                self.frame_box.selectAll()
             else:
                 return False
             return True
@@ -3713,7 +3885,8 @@ class ImageAnnotator(QMainWindow):
             return
         black, white = auto_levels(self._loaded.preview.convert("L").histogram())
         self._set_levels(black, white)
-        self.status_label.setText(f"Automatic levels for this image: black {black}, white {white} (F again: defaults)")
+        again = f" ({self._key('auto_levels')} again: defaults)" if self._key("auto_levels") else ""
+        self.status_label.setText(f"Automatic levels for this image: black {black}, white {white}{again}")
 
     def _set_levels(self, black: int, white: int) -> None:
         for box in (self.black_point, self.white_point):
@@ -4020,20 +4193,41 @@ class ImageAnnotator(QMainWindow):
             return VideoFrameRef(*video_frame)
         return self._source_image_path(image)
 
-    # Fields a plain COCO training export keeps.
+    def _fill_image_size(self, image: dict[str, Any]) -> None:
+        """Width and height of an image never shown, read from its file header (no pixels), upright as shown."""
+        if image.get("width") and image.get("height"):
+            return
+        source = self._image_source(image)
+        if isinstance(source, VideoFrameRef):
+            width, height = source.video.width, source.video.height
+        elif source is None:
+            return
+        else:
+            try:
+                with Image.open(source) as opened:
+                    width, height = opened.size
+                    if opened.getexif().get(0x0112) in (5, 6, 7, 8):  # EXIF orientation: a quarter turn
+                        width, height = height, width
+            except OSError:
+                return
+        image["width"], image["height"] = width, height
+
+    # Fields a plain COCO training export keeps. Boxes only: a segmentation from an opened file would no
+    # longer match a box edited here, so it is left out.
     COCO_IMAGE_FIELDS = ("id", "file_name", "width", "height", "license", "flickr_url", "coco_url", "date_captured")
-    COCO_ANNOTATION_FIELDS = ("id", "image_id", "category_id", "segmentation", "area", "bbox", "iscrowd")
+    COCO_ANNOTATION_FIELDS = ("id", "image_id", "category_id", "area", "bbox", "iscrowd")
 
     def _export_favorites(self) -> None:
-        """Data → Export Favorites…: copy the favorite images (whatever their state) to a folder, with a plain
+        """File → Export → Favorites…: copy the favorite images (whatever their state) to a folder, with a plain
         COCO JSON (favorites.json, indented) of their boxes as they are now: e.g. examples for a report."""
         if self.root is None:
             return
         self._commit_current_scene()
         favorites = [image for image in self.images if image.get("favorite")]
         if not favorites:
-            QMessageBox.information(self, "Export Favorites", "No image is marked as a favorite yet (T marks the "
-                                    "image shown).")
+            QMessageBox.information(self, "Export Favorites", "No image is marked as a favorite yet"
+                                    + (f" ({self._key('favorite')} marks the image shown)." if self._key("favorite")
+                                       else "."))
             return
         folder = QFileDialog.getExistingDirectory(self, "Choose a folder for the favorite images",
                                                   str(self.root.parent))
@@ -4173,10 +4367,11 @@ class ImageAnnotator(QMainWindow):
                         seen_categories.add(box.get("category_id"))
                         category[2] += 1
                         category[3 + state_names.index(state)] += 1
-                    user = per_user.setdefault(box.get("annotator_id"), [0, 0, 0])
+                    credited = self._annotation_user_name(box)  # a user, "model" or "–"
+                    user = per_user.setdefault(credited, [0, 0, 0])
                     user[0 if verified else 1] += 1
-                    if box.get("annotator_id") not in seen_users:
-                        seen_users.add(box.get("annotator_id"))
+                    if credited not in seen_users:
+                        seen_users.add(credited)
                         user[2] += 1
             totals = [sum(per_state[state][column] for state in state_names) for column in range(7)]
             state_rows = [[state.capitalize(), *per_state[state]] for state in state_names] + [["All", *totals]]
@@ -4203,8 +4398,8 @@ class ImageAnnotator(QMainWindow):
                  for category_id, counts in per_category.items()), key=lambda row: row[1])
             fill(category_table, category_headers, category_rows)
             user_rows = sorted(
-                ([self._user_name_by_id.get(user_id, "Unassigned"), counts[0] + counts[1], counts[0], counts[1],
-                  counts[2]] for user_id, counts in per_user.items()), key=lambda row: -row[1])
+                ([name, counts[0] + counts[1], counts[0], counts[1], counts[2]]
+                 for name, counts in per_user.items()), key=lambda row: -row[1])
             fill(user_table, user_headers, user_rows)
             text_parts[:] = [*lines, "", *table_text(state_headers, state_rows),
                              *table_text(category_headers, category_rows), *table_text(user_headers, user_rows)]
@@ -4227,6 +4422,7 @@ class ImageAnnotator(QMainWindow):
         return bool(
             self.annotations_by_image.get(image_id)
             or self.background_by_image.get(image_id, False)
+            or self.image_by_id.get(image_id, {}).get("favorite")
         )
 
     def _choose_json_save_path(self, title: str, suggested: Path) -> Path | None:
@@ -4409,7 +4605,8 @@ class ImageAnnotator(QMainWindow):
         """Mark that this PC is saving the project file. Returns the lock path, None if no lock could be
         written (saving goes on), or False if another PC is saving it right now (the user was told)."""
         lock = save_path.with_name(save_path.name + ".lock")
-        me = f"{os.environ.get('COMPUTERNAME') or os.environ.get('HOSTNAME') or 'this PC'}"
+        # HOSTNAME is usually not set for a desktop app on Linux; the socket name always is.
+        me = os.environ.get("COMPUTERNAME") or socket.gethostname() or "this PC"
         try:
             other = json.loads(lock.read_text(encoding="utf-8"))
             if time.time() - float(other.get("time", 0)) < self.SAVE_LOCK_SECONDS and other.get("pc") != me:
@@ -4811,7 +5008,7 @@ class ImageAnnotator(QMainWindow):
         """A data version as listed, like box versions: date, name, who added it, and the first line of its note."""
         time_text = str(tag.get("time") or "")
         parts = [f"{time_text[:16].replace('T', ' ')} UTC" if time_text else "time unknown",
-                 str(tag.get("name")), str(tag.get("by") or "Unassigned")]
+                 str(tag.get("name")), str(tag.get("by") or "–")]
         note = str(tag.get("note") or "").strip().splitlines()
         if with_note and note:
             parts.append(f"{note[0][:60]}{'…' if len(note[0]) > 60 or len(note) > 1 else ''}")
@@ -4997,7 +5194,7 @@ class ImageAnnotator(QMainWindow):
         explanation = QLabel("A data version holds the work from when it was added until the next one is added; "
                              "the newest is the current project. Click an older one to show the boxes as they were "
                              "at its end (read-only; the project is not edited), and the current one to go back. "
-                             "Export Training Dataset can export a version as it was then. Changes to names, notes "
+                             "File → Export → Training Dataset… can export a version as it was then. Changes to names, notes "
                              "and the list apply when you click Save.")
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -5114,6 +5311,10 @@ class ImageAnnotator(QMainWindow):
                     self.next_annotation_id += 1
                 annotation.update(category_id=category_id, bbox=[float(value) for value in record["bbox"]],
                                   verified=is_verified(record.get("verified", True)))
+                if self._model_score(record) is not None:
+                    annotation["score"] = record["score"]
+                else:
+                    annotation.pop("score", None)
                 annotation["area"] = annotation["bbox"][2] * annotation["bbox"][3]
                 if box_id not in current or not same_content(current[box_id], annotation):
                     annotation["annotator_id"] = user_id
@@ -5160,7 +5361,7 @@ class ImageAnnotator(QMainWindow):
         return min(later, default=None)
 
     def _revert_to(self) -> None:
-        """Data → Show a Data Version…: show the project as it was at the end of a data version; the newest
+        """Data → Show Data Version…: show the project as it was at the end of a data version; the newest
         version is the current project."""
         if self.root is None:
             return
@@ -5464,6 +5665,8 @@ class ImageAnnotator(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Cannot merge", f"Could not read {Path(other).name}:\n\n{error}")
             return
+        if isinstance(theirs, dict):
+            self._normalize_user_ids(theirs)
         mine = self._merge_input()
         merged = self._merge_dialog(mine, theirs, Path(other).name, "Merge")
         if merged is None:
@@ -5498,15 +5701,17 @@ class ImageAnnotator(QMainWindow):
         if save_path is not None and not self.dirty:
             return True
         self._commit_current_scene()
-        # Only verified and review images are saved; unverified ones can always be rescanned.
-        # Verified and Review images are saved; an Unverified one too once the project holds work on it
-        # (it was saved with a state, or has box history), so setting it back to Unverified loses nothing.
+        # Verified and Review images are saved; an Unverified one too when it holds anything: boxes (e.g. from an
+        # opened file), a favorite mark, box history or a saved state. Only an Unverified image with none of these
+        # (one only scanned from a folder) stays out: it can always be added again.
         self._ensure_saved_cache()
         history_images = self._history_index()[0]
         export_images = [
             image for image in self.images
             if self._frame_state(image["id"]) != "unverified" or image["id"] in history_images
             or image_key(image["file_name"]) in self._saved_state_keys
+            or image.get("favorite")  # a favorite mark is work too, whatever the image's state
+            or self.annotations_by_image.get(image["id"])  # boxes, e.g. from an opened file: kept as Unverified
         ]
         if not export_images and not self.dirty:
             QMessageBox.information(
@@ -5580,6 +5785,7 @@ class ImageAnnotator(QMainWindow):
             if source is None:
                 missing.append(Path(image["file_name"]))
                 continue
+            self._fill_image_size(image)
             target_name = image["file_name"].replace("\\", "/").rsplit("/", 1)[-1]
             target = self.root / target_name
             key = target_name.casefold()
@@ -5616,7 +5822,7 @@ class ImageAnnotator(QMainWindow):
                 self, "Images not found in project folder",
                 "These image paths were not present in the project image folder and could not be packaged:\n\n"
                 + "\n".join(str(path) for path in missing[:20])
-                + "\n\nAdd the folder or video they come from (File → Add Folder… / Add Video Folder…) "
+                + "\n\nAdd the folder or video they come from (File → Add Image Folder… / Add Video Folder…) "
                 "and save again.",
             )
             return False
@@ -5708,6 +5914,8 @@ class ImageAnnotator(QMainWindow):
             except (OSError, ValueError) as error:
                 QMessageBox.critical(self, "Cannot merge", f"Could not read {save_path.name}:\n\n{error}")
                 return False
+            if isinstance(theirs, dict):
+                self._normalize_user_ids(theirs)
             # Unverified images are not written, but their boxes are ours too and must not be overwritten.
             saved_ids = {record["id"] for record in records}
             unverified_ids = {
@@ -5978,6 +6186,7 @@ class ImageAnnotator(QMainWindow):
             if source is None:
                 missing.append(Path(image["file_name"]))
                 continue
+            self._fill_image_size(image)
             name = Path(image["file_name"]).name
             target = destination / name
             key = name.casefold()
@@ -6365,7 +6574,7 @@ class ImageAnnotator(QMainWindow):
                             image = reader.read_frame(source.index).convert("RGB")
                         elif source is not None:
                             with Image.open(source) as opened:
-                                image = ImageOps.exif_transpose(opened).convert("RGB")  # as shown in the app
+                                image = to_rgb(ImageOps.exif_transpose(opened))  # as shown in the app
                         else:
                             raise OSError("image file not found")
                     except Exception as error:  # noqa: BLE001 - listed for the user afterwards
@@ -6556,6 +6765,7 @@ class ImageAnnotator(QMainWindow):
         self._loaded = None
         self.current_image_id = None
         self.annotation_list.clear()
+        self.box_list_header.hide()
         if self._image_path(image_id) is None:
             QMessageBox.critical(
                 self, "Invalid image path",
@@ -6637,6 +6847,7 @@ class ImageAnnotator(QMainWindow):
         self._pending_image_id = None
         self.edit_status.setEnabled(False)
         self.annotation_list.clear()
+        self.box_list_header.hide()
         if previous_id is not None:
             self._drop_unused_video_frame(previous_id)
         self._sync_frame_controls()
@@ -6666,23 +6877,15 @@ class ImageAnnotator(QMainWindow):
     def _commit_current_scene(self) -> None:
         if self.current_image_id is None or self._viewing is not None:
             return  # a data version's boxes are only shown
+        # Only a box moved or resized here gets new coordinates: those stay on the image while edited. A box
+        # that came in reaching past the image edge (or with no size) is kept exactly as it came.
         annotations = []
-        image = self.image_by_id[self.current_image_id]
-        width, height = image.get("width"), image.get("height")
         for item in self.current_items:
-            x, y, box_width, box_height = item.scene_bbox()
-            right, bottom = x + box_width, y + box_height
-            x, y = max(0.0, x), max(0.0, y)
-            if width:
-                right = min(float(width), right)
-            if height:
-                bottom = min(float(height), bottom)
-            box_width, box_height = right - x, bottom - y
-            if box_width <= 0 or box_height <= 0:
-                continue
             annotation = item.annotation
-            annotation["bbox"] = [x, y, box_width, box_height]
-            annotation["area"] = box_width * box_height
+            bbox = item.scene_bbox()
+            if [round(float(value), 6) for value in annotation["bbox"]] != [round(value, 6) for value in bbox]:
+                annotation["bbox"] = bbox
+                annotation["area"] = bbox[2] * bbox[3]
             annotations.append(annotation)
         self.annotations_by_image[self.current_image_id] = annotations
 
@@ -6874,7 +7077,7 @@ class ImageAnnotator(QMainWindow):
             self._sync_frame_controls()
 
     def _set_frame_state(self, state: str) -> None:
-        """Set the current image to verified, review or unverified (buttons, Shift+V and C)."""
+        """Set the current image to verified, review or unverified (buttons and their shortcut keys)."""
         image_id = self.current_image_id
         if image_id not in self.image_by_id:
             return
@@ -6884,7 +7087,9 @@ class ImageAnnotator(QMainWindow):
         if state == "verified" and not self._has_verification_basis(image_id):
             self._sync_frame_controls()
             self.status_label.setText(
-                "To verify this image, verify every box (V), or mark it as background if it has none."
+                "To verify this image, verify every box"
+                + (f" ({self._key('verify_box')})" if self._key("verify_box") else "")
+                + ", or mark it as background if it has none."
             )
             return
         self.frame_verified_by_image[image_id] = state == "verified"
@@ -6896,9 +7101,12 @@ class ImageAnnotator(QMainWindow):
         self.touched_image_ids.add(image_id)
         self._update_frame_item_text(image_id)
         self.dirty = True
+        # An Unverified image stays in the project when it holds anything; only an empty one is left out at Save.
+        kept = (self._frame_has_work(image_id) or image_id in self._history_index()[0]
+                or image_key(self.image_by_id[image_id]["file_name"]) in self._saved_state_keys)
         self.status_label.setText(
-            "Image set to Unverified — it will not be saved" if state == "unverified"
-            else f"Image set to {state.capitalize()} — unsaved changes"
+            ("Image set to Unverified — unsaved changes" if kept else "Image set to Unverified — left out at Save")
+            if state == "unverified" else f"Image set to {state.capitalize()} — unsaved changes"
             + (f"; model score removed from {dropped:,} verified box{'' if dropped == 1 else 'es'}"
                if dropped else "")
         )
@@ -6943,7 +7151,9 @@ class ImageAnnotator(QMainWindow):
             if state == "verified":
                 for annotation in self.annotations_by_image.get(image_id, []):
                     if "score" in annotation and is_verified(annotation.get("verified", True)):
+                        # A new version by whoever verified; the scored one stays in history at save.
                         del annotation["score"]
+                        self._set_annotation_annotator(annotation)
                         dropped += 1
             self._note_state_change(image_id)
             self.touched_image_ids.add(image_id)
@@ -7005,7 +7215,10 @@ class ImageAnnotator(QMainWindow):
         bottom = max(0.0, min(height, rect.bottom()))
         if right - left < 2 or bottom - top < 2:
             return
-        category_id = self._ask_category("Choose category", self._last_category_id)
+        if self.repeat_category_check.isChecked() and self._last_category_id in self.categories:
+            category_id = self._last_category_id
+        else:
+            category_id = self._ask_category("Choose category", self._last_category_id)
         if category_id is None:
             return
         self._last_category_id = category_id  # offered first the next time a box is drawn
@@ -7126,28 +7339,54 @@ class ImageAnnotator(QMainWindow):
         earlier_versions = Counter(record.get("box_id") for record in self._history_on_image(self.current_image_id))
         key = image_key(self.image_by_id[self.current_image_id]["file_name"]) if self.current_image_id in self.image_by_id else None
         by_box_id, by_number = self._saved_cache
+
+        def short_note(note: str) -> str | None:
+            if not note:
+                return None
+            first = note.splitlines()[0]
+            return "“" + first[:30] + ("…" if len(first) > 30 or "\n" in note else "") + "”"
+
+        # Each row's fields, by column; the header (above the list) names only the columns this image uses.
+        live = []
         for row, item in enumerate(self.current_items):
-            status = "verified" if is_verified(item.annotation.get("verified", True)) else "unverified"
-            user_name = self._annotation_user_name(item.annotation)
-            versions = earlier_versions[item.annotation.get("box_id")] + 1  # saved versions; right-click → Box history…
-            text = f"{item.category_name} · {status} · {user_name}"
-            score = self._model_score(item.annotation)
-            if score is not None:
-                text += f" · score {score:.2f}"
-            if versions > 1:
-                text += f" · {versions} versions"
-            best_iou = best_ious[row]
-            if best_iou > 0:
-                text += f" · IoU {best_iou:.2f}"
+            annotation = item.annotation
+            versions = earlier_versions[annotation.get("box_id")] + 1  # saved versions; right-click → Box History…
+            score = self._model_score(annotation)
             # Changes since the last save, marked like an unsaved deletion.
-            saved = by_box_id.get((key, item.annotation.get("box_id"))) or by_number.get((key, item.annotation.get("id")))
-            unsaved = saved is None or not same_content(saved, dict(item.annotation, bbox=boxes[row]))
+            saved = by_box_id.get((key, annotation.get("box_id"))) or by_number.get((key, annotation.get("id")))
+            unsaved = saved is None or not same_content(saved, dict(annotation, bbox=boxes[row]))
+            live.append(({
+                "class": item.category_name,
+                "verified": "✓" if is_verified(annotation.get("verified", True)) else None,
+                "user": self._annotation_user_name(annotation),
+                "score": f"{score:.2f}" if score is not None else None,
+                "ver": str(versions) if versions > 1 else None,
+                "iou": f"{best_ious[row]:.2f}" if best_ious[row] > 0 else None,
+                "note": short_note(box_note(annotation)),
+            }, unsaved))
+        deleted = []
+        if self.current_image_id is not None:
+            for record, unsaved in self._deleted_rows(self.current_image_id):
+                deleted.append(({
+                    "class": self._category_name(record.get("category_id")),
+                    "verified": "✓" if is_verified(record.get("verified", True)) else None,
+                    "user": self.current_annotator if unsaved else self._annotation_user_name(record),
+                    "note": short_note(box_note(record)),
+                }, unsaved, record))
+        every = [fields for fields, _unsaved in live] + [fields for fields, _unsaved, _record in deleted]
+        columns = ["class", "verified", "user",
+                   *(name for name in ("score", "ver", "iou", "note") if any(fields.get(name) for fields in every))]
+        titles = {"class": "Class", "verified": "✓", "user": "User", "score": "Score", "ver": "Ver", "iou": "IoU",
+                  "note": "Note"}
+        self.box_list_header.setText(" · ".join(titles[name] for name in columns))
+        self.box_list_header.setVisible(bool(every))
+
+        def row_text(fields: dict[str, Any]) -> str:
+            return " · ".join(fields.get(name) or "–" for name in columns)
+
+        for row, (item, (fields, unsaved)) in enumerate(zip(self.current_items, live)):
+            list_item = QListWidgetItem(row_text(fields) + ("*" if unsaved else ""))
             note = box_note(item.annotation)
-            if note:
-                first = note.splitlines()[0]
-                more = len(first) > 30 or "\n" in note
-                text += " · “" + first[:30] + ("…" if more else "") + "”"
-            list_item = QListWidgetItem(text + ("*" if unsaved else ""))
             tips = ["Unsaved changes"] if unsaved else []
             if note:
                 tips.append("Note: " + note)
@@ -7162,29 +7401,22 @@ class ImageAnnotator(QMainWindow):
         # Deleted boxes follow, greyed out and without a colour: their last version, not drawn.
         self._clear_deleted_preview()
         self._deleted_list_rows = []
-        if self.current_image_id is not None:
-            grey = self.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text)
-            blank = self._swatch(None)
-            for record, unsaved in self._deleted_rows(self.current_image_id):
-                category_name = self._category_name(record.get("category_id"))
-                status = "verified" if is_verified(record.get("verified", True)) else "unverified"
-                deleted_by = self.current_annotator if unsaved else self._user_name_by_id.get(
-                    record.get("annotator_id"), "Unassigned")
-                list_item = QListWidgetItem(
-                    f"{category_name} · {status} · {deleted_by} · deleted{'*' if unsaved else ''}"
-                )
-                list_item.setIcon(blank)
-                list_item.setForeground(grey)
-                list_item.setToolTip(
-                    ("Deleted box (unsaved changes)." if unsaved else "Deleted box.")
-                    + " Select to outline where it was; right-click to restore it."
-                )
-                self.annotation_list.addItem(list_item)
-                list_item.setHidden(bool(search) and search not in category_name.casefold())
-                self._deleted_list_rows.append(record)
-                if selected_item is None and self._selected_deleted == (self.current_image_id, record.get("box_id")):
-                    selected_row = self.annotation_list.count() - 1
-                    self._deleted_preview = self._outline(record)
+        grey = self.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text)
+        blank = self._swatch(None)
+        for fields, unsaved, record in deleted:
+            list_item = QListWidgetItem(f"{row_text(fields)} · deleted{'*' if unsaved else ''}")
+            list_item.setIcon(blank)
+            list_item.setForeground(grey)
+            list_item.setToolTip(
+                ("Deleted box (unsaved changes)." if unsaved else "Deleted box.")
+                + " Select to outline where it was; right-click to restore it."
+            )
+            self.annotation_list.addItem(list_item)
+            list_item.setHidden(bool(search) and search not in fields["class"].casefold())
+            self._deleted_list_rows.append(record)
+            if selected_item is None and self._selected_deleted == (self.current_image_id, record.get("box_id")):
+                selected_row = self.annotation_list.count() - 1
+                self._deleted_preview = self._outline(record)
         if selected_item is not None:
             self._selected_deleted = None  # a box was chosen instead
         self.annotation_list.setCurrentRow(selected_row)
@@ -7234,11 +7466,11 @@ class ImageAnnotator(QMainWindow):
             None,
         )
         if category_id is None:
-            category_id = self._create_class(name)  # a new name becomes a category, like Edit → Add category
+            category_id = self._create_class(name)  # a new name becomes a category, like Edit → Categories… → Add
         return category_id
 
     def _change_category(self) -> None:
-        """Change the selected box's category (right-click → Change category…, or K)."""
+        """Change the selected box's category (right-click → Change category…, or its shortcut key)."""
         item = self._selected_item()
         if item is None or not self._editing_allowed():
             return
@@ -7273,7 +7505,8 @@ class ImageAnnotator(QMainWindow):
         """Remove the model score from verified boxes of the current, verified image.
 
         Once both the box and its image are verified, the box is a reviewed annotation rather than
-        model output. Undo brings the score back.
+        model output. This is a new version by the user verifying it: the scored version is kept in box history
+        at the next save. Undo brings the score back.
         """
         scored = [
             item.annotation for item in self.current_items
@@ -7282,11 +7515,13 @@ class ImageAnnotator(QMainWindow):
         if scored and push_undo:
             self._push_undo()
         for annotation in scored:
+            # A new version by whoever verified; the scored one stays in history at save.
             del annotation["score"]
+            self._set_annotation_annotator(annotation)
         return len(scored)
 
     def _edit_labels(self) -> None:
-        """Data → Categories…: add, rename, merge (rename to an existing name, or Delete on a category boxes
+        """Edit → Categories…: add, rename, merge (rename to an existing name, or Delete on a category boxes
         use), delete and color categories. Changes are listed in the dialog and applied together with Save;
         Cancel leaves the project as it was."""
         if not self._editing_allowed():
@@ -7726,10 +7961,29 @@ class ImageAnnotator(QMainWindow):
         self._set_saved_cache(base, self._base_json)
 
     @staticmethod
+    def _normalize_user_ids(data: dict[str, Any]) -> None:
+        """User ids as one kind of key throughout a file, in place: a number written as text ("3") becomes 3 on
+        users, boxes, versions and image states alike, so every record still matches its user."""
+        key = ImageAnnotator._user_key
+        for user in data.get("annotators") or []:
+            if isinstance(user, dict) and "id" in user:
+                user["id"] = key(user["id"])
+        for name in ("annotations", "annotation_history", "state_history"):
+            for record in data.get(name) or []:
+                if isinstance(record, dict) and record.get("annotator_id") is not None:
+                    record["annotator_id"] = key(record["annotator_id"])
+        for image in data.get("images") or []:
+            if isinstance(image, dict) and image.get("state_by") is not None:
+                image["state_by"] = key(image["state_by"])
+
+    @staticmethod
     def _saved_index(base: dict[str, Any] | None, copy: bool = True) -> tuple:
-        """The index of a saved project the "*" markers, grey rows and the next save use; pure, so it
-        can be built on another thread. With ``copy`` False the index shares ``base``'s boxes, for data
-        nothing changes afterwards (what a save just wrote)."""
+        """The index of a saved project the "*" markers, grey rows and the next save use; it touches nothing
+        else, so it can be built on another thread. User ids in ``base`` are normalized first, in place (see
+        _normalize_user_ids). With ``copy`` False the index shares ``base``'s boxes, for data nothing changes
+        afterwards (what a save just wrote)."""
+        if isinstance(base, dict):
+            ImageAnnotator._normalize_user_ids(base)
         keys = {
             image_key(image["file_name"]) for image in (base or {}).get("images", [])
             if isinstance(image, dict) and "frame_state" in image and isinstance(image.get("file_name"), str)
@@ -7825,10 +8079,12 @@ class ImageAnnotator(QMainWindow):
             f"{time_text[:16].replace('T', ' ')} UTC" if time_text else "time unknown",
         ]
         parts += [
-            self._user_name_by_id.get(record.get("annotator_id"), "Unassigned"),
+            self._annotation_user_name(record),
             self._category_name(record.get("category_id")),
             "verified" if is_verified(record.get("verified", True)) else "unverified",
         ]
+        if self._model_score(record) is not None:
+            parts.append(f"score {self._model_score(record):.2f}")
         if record.get("deleted"):
             parts.append("deleted")
         if box_note(record):
@@ -7850,9 +8106,9 @@ class ImageAnnotator(QMainWindow):
         if 0 <= deleted_row < len(self._deleted_list_rows):
             record = self._deleted_list_rows[deleted_row]
             menu = QMenu(self)
-            restore_action = menu.addAction("Restore deleted box")
+            restore_action = menu.addAction("Restore Deleted Box")
             restore_action.setEnabled(self._editing_allowed())
-            history_action = menu.addAction("Box history…")
+            history_action = menu.addAction("Box History…")
             purge_action = self._add_purge_action(menu, self._editing_allowed())
             chosen = menu.exec(self.annotation_list.viewport().mapToGlobal(position))
             if chosen is restore_action:
@@ -7877,7 +8133,7 @@ class ImageAnnotator(QMainWindow):
         menu.addSeparator()
         submenu = menu.addMenu("Advanced")
         submenu.setEnabled(enabled)
-        purge_action = submenu.addAction("Delete permanently…")
+        purge_action = submenu.addAction("Delete Permanently…")
         purge_action.setEnabled(enabled)
         return purge_action
 
@@ -7888,7 +8144,7 @@ class ImageAnnotator(QMainWindow):
             return
         menu = QMenu(self)
         delete_action = self._add_purge_action(menu, self.current_annotator is not None and self._viewing is None)
-        delete_action.setText("Delete image permanently…")
+        delete_action.setText("Delete Image Permanently…")
         if menu.exec(self.frame_list.viewport().mapToGlobal(position)) is delete_action:
             self._delete_image_permanently(item.data(Qt.ItemDataRole.UserRole))
 
@@ -7968,17 +8224,18 @@ class ImageAnnotator(QMainWindow):
             deleted = self._deleted_rows(self.current_image_id)
             if not deleted:
                 return
-            deleted_action = menu.addAction(f"Deleted boxes… ({len(deleted)})")
+            deleted_action = menu.addAction(f"Deleted Boxes… ({len(deleted)})")
             if menu.exec(global_position) is deleted_action:
                 self._show_deleted_boxes()
             return
-        category_action = menu.addAction("Change category… (R)")
+        category_action = menu.addAction("Change Category…"
+                                         + (f" ({self._key('change_category')})" if self._key("change_category") else ""))
         category_action.setEnabled(self._editing_allowed() and bool(self.categories))
-        note_action = menu.addAction("Edit note…" if box_note(item.annotation) else "Add note…")
+        note_action = menu.addAction("Edit Note…" if box_note(item.annotation) else "Add Note…")
         note_action.setEnabled(self._editing_allowed())
-        history_action = menu.addAction("Box history…")
+        history_action = menu.addAction("Box History…")
         menu.addSeparator()
-        delete_action = menu.addAction("Delete (X / Del)")
+        delete_action = menu.addAction(f"Delete ({' / '.join(key for key in (self._key('delete_box'), 'Del') if key)})")
         delete_action.setEnabled(self._editing_allowed())
         purge_action = self._add_purge_action(menu, self._editing_allowed())
         chosen = menu.exec(global_position)
@@ -8143,6 +8400,10 @@ class ImageAnnotator(QMainWindow):
         item.update_handles()
         item.annotation["category_id"] = record["category_id"]
         item.annotation["verified"] = is_verified(record.get("verified", True))
+        if self._model_score(record) is not None:  # a version is restored as it was, model score included
+            item.annotation["score"] = record["score"]
+        else:
+            item.annotation.pop("score", None)
         if box_note(record):
             item.annotation["note"] = box_note(record)
         else:
@@ -8171,6 +8432,8 @@ class ImageAnnotator(QMainWindow):
             "annotator_id": self._annotator_id(self.current_annotator),
             "box_id": record.get("box_id"),  # its next rev follows the deletion record at save
         }
+        if self._model_score(record) is not None:
+            annotation["score"] = record["score"]
         if box_note(record):
             annotation["note"] = box_note(record)
         self.next_annotation_id += 1

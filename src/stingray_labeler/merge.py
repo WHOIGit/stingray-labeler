@@ -13,7 +13,7 @@ ordering.
   object. Should two copies hold one id with no version in common (ids from before box ids
   were random), they are different objects: both are kept and one gets a new id.
 * With names settled, a box's versions from both copies are compared by what they say (box,
-  category, user, verified, deleted) to see which are shared and which are new. If only one
+  category, user, verified, model score, deleted) to see which are shared and which are new. If only one
   copy changed a box, that copy's state of the box is taken, so a box an earlier merge kept
   stays kept. If both changed it, that is a conflict: the box is kept if either copy still
   has it, shown as its newest kept version, and the image is set to Review for an expert to
@@ -32,13 +32,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from .dataset import is_verified
+from .dataset import is_verified, model_score
 
 FRAME_STATES = ("verified", "review", "unverified")
 # Fields a version is rebuilt from; anything else on a current box is carried along as "extra".
 _BOX_FIELDS = {
     "id", "image_id", "category_id", "bbox", "area", "verified", "annotator_id",
-    "box_id", "rev", "time", "deleted", "note",
+    "box_id", "rev", "time", "deleted", "note", "score",
 }
 
 
@@ -170,6 +170,7 @@ def _content(version: dict[str, Any]) -> tuple:
     return (
         version["deleted"], (version["user"] or "").casefold(), version["category"].casefold(),
         tuple(round(value, 3) for value in version["bbox"]), version["verified"],
+        model_score(version),
     )
 
 
@@ -234,7 +235,7 @@ def _fingerprints(data: dict[str, Any], names: NameMap) -> tuple[dict[str, int],
             record.get("box_id"), str(record.get("time") or ""), record.get("rev") or 1, is_current,
             bool(record.get("deleted")) and not is_current, (user or "").casefold(), category.casefold(),
             tuple(round(float(value), 3) for value in bbox), is_verified(record.get("verified", True)),
-            str(record.get("note") or "").strip(),
+            str(record.get("note") or "").strip(), model_score(record),
         ))) & _MASK
     for entry in data.get("state_history") or []:  # earlier image states
         key = key_by_id.get(entry.get("image_id")) if isinstance(entry, dict) else None
@@ -316,10 +317,12 @@ def _side(data: dict[str, Any], names: NameMap | None = None,
             "renamed": category != raw_category or user != raw_user,
             "bbox": [float(value) for value in record["bbox"]],
             "verified": is_verified(record.get("verified", True)),
+            "score": record.get("score"),  # as written, never rounded
             "note": str(record.get("note") or "").strip(),
             "deleted": bool(record.get("deleted")) and not is_current,
             "current": is_current,
-            "extra": {name: value for name, value in record.items() if name not in _BOX_FIELDS} if is_current else {},
+            # Fields from elsewhere (e.g. a segmentation), kept with every version, earlier ones too.
+            "extra": {name: value for name, value in record.items() if name not in _BOX_FIELDS},
             "id": record.get("id") if is_current else None,
         })
     chains: dict[str, list[dict[str, Any]]] = {}
@@ -334,8 +337,9 @@ def _side(data: dict[str, Any], names: NameMap | None = None,
             "box_id": box_id, "versions": versions,
             "current": next((version["label"] for version in versions if version["current"]), None),
         })
-    # An unverified image with no boxes holds no work, so it is not part of this copy.
-    images = {key: image for key, image in images.items() if image["state"] != "unverified" or key in chains}
+    # An unverified image with no boxes and no favorite mark holds no work, so it is not part of this copy.
+    images = {key: image for key, image in images.items()
+              if image["state"] != "unverified" or key in chains or image["record"].get("favorite")}
     return images, chains
 
 
@@ -727,6 +731,8 @@ def build_project(
                 record: dict[str, Any] = {"box_id": box_id, "rev": version["rev"]}
                 if version["time"]:
                     record["time"] = version["time"]
+                if version["score"] is not None:
+                    record["score"] = version["score"]
                 annotator = user_id(version["user"])
                 if annotator is not None:
                     record["annotator_id"] = annotator
@@ -747,6 +753,7 @@ def build_project(
                     annotation.update(record)
                     kept_annotations.append(annotation)
                 else:
+                    record = {**version["extra"], **record}
                     record.update({
                         "image_id": image_id, "category_id": category_id(version["category"], current=False),
                         "bbox": [x, y, width, height], "verified": version["verified"],

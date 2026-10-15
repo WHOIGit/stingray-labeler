@@ -10,7 +10,7 @@ Stingray Labeler draws and reviews bounding boxes on images and on frames of unc
 
 | State | Meaning | Saved? |
 |---|---|---|
-| **Unverified** | Not reviewed. | No — it can always be added again. |
+| **Unverified** | Not reviewed. | When it holds boxes (e.g. from an opened file), a favorite mark or earlier saved work; an empty one is left out (it can always be added again). |
 | **Review** | Worth keeping in the dataset; its boxes are being checked. | Yes |
 | **Verified** | Every box is verified and the image has been inspected as a whole. | Yes |
 
@@ -26,7 +26,9 @@ The first edit of an Unverified image (drawing, moving, resizing, deleting or ve
 
 1. **File → New Project…** (Ctrl+N): choose the folder of images. Choose or type your user name.
 2. Or **File → Open Project…** (Ctrl+O): choose the project's image folder, then its JSON. Images without an image state (any plain COCO file, e.g. model output) open as **Unverified**; to set many at once, use **Data → Set State of Listed Images**.
-3. Add more sources at any time from the **File** menu: **Add Images…**, **Add Folder…**, **Add Video…**, **Add Video Folder…**.
+3. Add more sources at any time from the **File** menu: **Add Images…**, **Add Image Folder…**, **Add Video…**, **Add Video Folder…**.
+
+16-bit and floating-point images (e.g. scientific TIFFs) are shown stretched from their own lowest to highest value; the file itself is never changed.
 
 ### Where images are read from
 
@@ -47,7 +49,7 @@ When a project opens, images are read from the project folder. When you add a fo
 - **Clear Filters** — same as the panel's **Clear**.
 - **Counts** — one line that wraps to the panel's width; hover for the full breakdown.
 
-**Centre** — the image, rulers, and below it the info line: `Dim` (pixels), `Size` (file size, or raw size for a video frame) and `Boxes`. With a video selected, the frame slider and frame number box appear on the right of that line.
+**Centre** — the image, rulers, and below it the info line: position in the list, size in pixels, file size (raw size for a video frame) and boxes (how many are verified, ✓). With a video selected, the frame slider and frame number box appear on the right of that line.
 
 **Right panel** — **State** (Unverified / Review / Verified), **Draw box**, **Background**, **Box verified** for the selected box, and the list of boxes in the image, with a search box that shows only boxes whose current category matches. Deleted boxes stay at the end of the list in grey: select one to outline where it was, right-click it to restore it.
 
@@ -58,7 +60,7 @@ When a project opens, images are read from the project folder. When you add a fo
 - **S / W** select the next / previous box in the image (in box list order, skipping boxes hidden by the box search) and scroll it into view.
 - Up / Down move through whichever list has the keyboard focus.
 - The **Navigation** menu lists these moves.
-- **Right-click an image in the list → Advanced ▸ Delete image permanently…** removes an image added by mistake (e.g. a damaged frame), after asking: its record, its boxes with all their earlier versions, and its state history leave the project at the next save, and its file in the project folder goes to the Recycle Bin. Files in added folders and videos are never touched. It cannot be undone, and a copy of the project that still has the image brings it back if merged later.
+- **Right-click an image in the list → Advanced ▸ Delete Image Permanently…** removes an image added by mistake (e.g. a damaged frame), after asking: its record, its boxes with all their earlier versions, and its state history leave the project at the next save, and its file in the project folder goes to the Recycle Bin. Files in added folders and videos are never touched. It cannot be undone, and a copy of the project that still has the image brings it back if merged later.
 
 ## Working with videos
 
@@ -84,18 +86,18 @@ Only **uncompressed AVI** video can be read; frames are read directly, one at a 
 ## Drawing and editing boxes
 
 - **Draw box** or **B**, then drag on the image. **Esc** cancels.
-- When you release, choose a category — or **type a new name** to create it. The last category used is offered first.
+- When you release, choose a category — or **type a new name** to create it. The last category used is offered first. Tick **Repeat last category** (beside Draw box) to give new boxes that category without being asked.
 - Drag a box to move it; drag any of its four corner handles to resize it.
-- **R**, double-clicking the box in the list, or right-click → **Change category…** changes the selected box's category; type to search, or type a new name to add it.
+- **R**, double-clicking the box in the list, or right-click → **Change Category…** changes the selected box's category; type to search, or type a new name to add it.
 - **V** toggles the selected box between verified and unverified.
 - **X** or **Delete** (or right-click the box → **Delete**) removes the selected box; it stays in the list in grey and can be restored.
 - **Background** marks an image with no objects; it can be ticked only when the image has no boxes.
-- **Ctrl+Z / Ctrl+Y** undo and redo edits on the image shown; moving to another image ends the step-by-step undo. Back on an image with unsaved box edits, **Ctrl+Z** puts its boxes back as last saved in one step (**Ctrl+Y** brings the edits back). Undoing back to the saved image clears its `*`. For older changes use Box history or data versions.
+- **Ctrl+Z / Ctrl+Y** undo and redo edits on the image shown; moving to another image ends the step-by-step undo. Back on an image with unsaved box edits, **Ctrl+Z** puts its boxes back as last saved in one step (**Ctrl+Y** brings the edits back). Undoing back to the saved image clears its `*`. For older changes use Box History or data versions.
 - **Space + drag** or dragging with the middle mouse button pans; the mouse wheel zooms. A middle-button click (without dragging) works like **F**: automatic black/white levels, click again for the defaults.
 
 ## Favorites
 
-**T** marks the image shown as a favorite, e.g. a good example for a report or a talk; **T** again unmarks it. A favorite shows **★** before its name in the image list and after its position below the image. It is saved with the image (it is not part of the box history or the training export) and kept by a merge if either copy has it. **Data → Filter → Favorites Only** lists only favorites, and **Data → Export Favorites…** copies the favorite images, whatever their state, to a folder with `favorites.json`, a plain COCO file of their boxes as they are now.
+**T** marks the image shown as a favorite, e.g. a good example for a report or a talk; **T** again unmarks it. A favorite shows **★** before its name in the image list and after its position below the image. It is saved with the image (it is not part of the box history or the training export) and kept by a merge if either copy has it. **Data → Filter → Favorites Only** lists only favorites, and **File → Export → Favorites…** copies the favorite images, whatever their state, to a folder with `favorites.json`, a plain COCO file of their boxes as they are now.
 
 ## Setting the image state
 
@@ -104,56 +106,56 @@ Click **Unverified**, **Review** or **Verified**, or use the keys:
 - **Shift+V** — Verified ↔ Review.
 - **C** — Review ↔ Unverified (on a Verified image, C sets Review).
 
-Setting an image to Unverified means it will not be saved.
+Setting an image to Unverified keeps it in the project when it holds boxes, a favorite mark or earlier saved work; an empty image is left out at the next save.
 
-**Data → Set State of Listed Images ▸ Verified / Review / Unverified** sets every image the list shows, with its filters applied, to one state, after asking. The same rules apply as for one image: an image with an unverified box, or with no boxes and no background mark, cannot be Verified and stays as it is (the confirmation says how many), and verifying removes the model score from its verified boxes. For example, after opening manual annotations from another pipeline, whose images come in Unverified: list them, then set them to Verified.
+**Data → Set State of Listed Images ▸ Verified / Review / Unverified** sets every image the list shows, with its filters applied, to one state, after asking. The same rules apply as for one image: an image with an unverified box, or with no boxes and no background mark, cannot be Verified and stays as it is (the confirmation says how many), and verifying removes the model score from its verified boxes (the scored version stays in box history). For example, after opening manual annotations from another pipeline, whose images come in Unverified: list them, then set them to Verified.
 
 ## Saving
 
-**File → Save Project** (Ctrl+S) saves every **Verified** and **Review** image with all of its boxes, verified or not. An Unverified image is not saved unless the project already holds work on it: once an image has been saved, setting it back to Unverified keeps it, its boxes and its box history in the project (saved as Unverified, never exported for training).
+**File → Save** (Ctrl+S) saves every **Verified** and **Review** image with all of its boxes, verified or not. An Unverified image is saved too, as Unverified and never exported for training, when it holds anything: boxes (e.g. model output from an opened file), a favorite mark, box history or a saved state. Only an empty Unverified image, e.g. one only scanned from a folder, is left out. A saved image must be in the project folder (or come from an added folder or video): if one is missing, Save says which and saves nothing.
 
 - Images not yet in the project folder are copied there; video frames are written as PNG.
 - **Nothing is ever deleted from the project folder.** If a saved image already exists there, you are asked per file: **Skip** (keep the folder's file), **Overwrite** (replace it from the current source), **Skip all** or **Overwrite all**. You are asked about each file once per session. After **Skip**, the image opens from the folder's file, since that is the one the project names.
 - **Images are identified by file name:** different images must never share a name. A project file that lists two images with the same name is refused when opened.
 - **A save is all or nothing.** Files being overwritten are swapped in only at the end; if any step fails (for example a file locked by a viewer or OneDrive), every original is put back and the files this save wrote are removed.
 - If the project file was changed by someone else, **Save As** suggests a new name and will not write over that file; use **Save → Merge…** to combine instead.
-- **Save Project As…** (Ctrl+Shift+S) saves to a different JSON file.
+- **File → Save As…** (Ctrl+Shift+S) saves to a different JSON file.
 
 ### Box history
 
 Each save keeps a record of how boxes changed, so earlier work is never lost:
 
 - Every box has a hidden **box id**, a **version** number and the UTC **time** of that version. The box id only ties a box's versions together and is never shown. It follows one fixed rule, so any tool can reproduce it: it is computed from the image's file name, when the box was first created (its first save) and where it was then, so the same box gets the same id on any platform. It never changes when the box is edited, deleted or restored, and is never reused. Boxes from a plain COCO file or with an id in another format (such as an old `2-5`) get theirs the same way when the file is opened.
-- Changing a box, yours or someone else's, keeps its saved version in the project's history and makes the change the next version at save.
+- Changing a box, yours or someone else's, keeps its saved version in the project's history and makes the change the next version at save. A version holds the box, its category, verification and model score: when verifying an image removes the score from its verified boxes, that is a new version by the user who verified it, and the model's version, score included, stays in the history (Box History shows it).
 - Deleting a box keeps its last version in the history, with a record of who deleted it (the user active when it was deleted, even if someone else saves) and when.
 - Undo and Redo count as changes by the user who presses them: a box they bring back to a state that differs from the saved one is credited to that user at the next save.
 - Edits between two saves count once, so undo and repeated adjustments add nothing.
 - A plain COCO file starts its history at the first save.
 
-Each row in the box list reads `category · verified · last user · versions · IoU` (e.g. `car · verified · alex · 3 versions · IoU 0.12`). Versions appear only on boxes with more than one, and IoU only when the box overlaps another. A `*` marks changes not saved yet: at the end of a box row (on grey rows, `deleted*`), after an image's name in the image list, and in the window title. Hover a marked row to see "Unsaved changes". Once saved, the version count shows the box was changed. Right-click a box (on the image or in the list):
+A line above the box list names the fields of each row, e.g. `Class · ✓ · User · Score · Ver · IoU`, and each row follows it, e.g. `car · ✓ · alex · – · 3 · 0.12`. **✓** marks a verified box; **User** is who last changed the box (**model** for a box with a model score that no one has changed); **Score** is the model score, **Ver** the number of saved versions and **IoU** the highest overlap with another box. A field appears only when a box in the image has it, and `–` stands for a value a box does not have. Deleted rows end with `deleted`. A `*` marks changes not saved yet: at the end of a box row (on grey rows, `deleted*`), after an image's name in the image list, and in the window title. Hover a marked row to see "Unsaved changes". Once saved, the version count shows the box was changed. Right-click a box (on the image or in the list):
 
-- **Add note… / Edit note…** — a short note on the box. The box list shows its start (hover for all of it). Changing a note alone is not a new version of the box. Notes are not part of the training export.
-- **Box history…** — every saved version, newest first. Selecting one outlines it in magenta on the image; **Restore this version** applies it as your edit (Ctrl+Z undoes it). It also works on grey deleted rows, including ones deleted since the last save; restoring a version brings the box back as that version.
-- **Deleted boxes…** (right-click empty space on the image; shown only when there are some) — boxes deleted on this image, including ones deleted since the last save (marked `deleted*`); select one to see it and **Restore** to bring it back.
-- **Advanced ▸ Delete permanently…** — kept in its own submenu at the bottom so it is not clicked by accident. It removes the box and all its earlier versions from the project for good (asks first; no grey row, no restore, no undo). Use it for boxes that should never have existed; ordinary **Delete** keeps the box's history.
+- **Add Note… / Edit Note…** — a short note on the box. The box list shows its start (hover for all of it). Changing a note alone is not a new version of the box. Notes are not part of the training export.
+- **Box History…** — every saved version, newest first. Selecting one outlines it in magenta on the image; **Restore this version** applies it as your edit (Ctrl+Z undoes it). It also works on grey deleted rows, including ones deleted since the last save; restoring a version brings the box back as that version.
+- **Deleted Boxes…** (right-click empty space on the image; shown only when there are some) — boxes deleted on this image, including ones deleted since the last save (marked `deleted*`); select one to see it and **Restore** to bring it back.
+- **Advanced ▸ Delete Permanently…** — kept in its own submenu at the bottom so it is not clicked by accident. It removes the box and all its earlier versions from the project for good (asks first; no grey row, no restore, no undo). Use it for boxes that should never have existed; ordinary **Delete** keeps the box's history.
 
-**Export Training Dataset** leaves the history out.
+**File → Export → Training Dataset…** leaves the history out.
 
 **Image states have a history too.** When a save changes an image's state or Background mark, the image records when and by whom, and its previous state is kept. A merge uses it like box history: if only one copy changed an image's state since the state both copies last shared, that copy's state is taken; if both changed it, the image is set to Review.
 
 **Data → Data Versions…** starts a new version, with an optional note (it asks you to save first). A version holds your work from when it is added until the next version is added: the newest version is the current project, and the title bar shows its name. You can edit the note later below the list, and **Rename…** changes the name; adding, renaming, deleting and notes apply when you click **Save** (**Cancel** drops them). Click an older version to show the boxes as they were at its end, when the next version was added (it asks first); click the current version at the top to go back. Use it before changing annotation strategy, or for each training set you build: export and revert work from data versions only (not dates, which depend on each PC's clock). Opening data that has no data version creates one, named after the opened file, that marks the data as opened; it is kept when you save.
 
-**Data → Show a Data Version…** (or clicking a version in Data Versions) shows every image's boxes as they were at the end of a data version, as last saved. It asks nothing and changes nothing: the project's boxes, unsaved edits included, stay as they are, editing is off, and the title bar shows the version as read-only. **Export Training Dataset** offers the version shown. Choose the current (newest) version to go back and edit again. Categories merged away since are shown under their old name, marked "(merged)".
+**Data → Show Data Version…** (or clicking a version in Data Versions) shows every image's boxes as they were at the end of a data version, as last saved. It asks nothing and changes nothing: the project's boxes, unsaved edits included, stay as they are, editing is off, and the title bar shows the version as read-only. **Export → Training Dataset…** offers the version shown. Choose the current (newest) version to go back and edit again. Categories merged away since are shown under their old name, marked "(merged)".
 
-**Data → Restore This Version…** (or the button in Data Versions), while an older version is shown, puts every image's boxes and state back as they were then, as your edits, and starts a new data version (e.g. *Restored v1*; it asks for the name, and to save first if needed). Later versions stay as they are and can still be shown or exported; **Changed in Version** on the new version lists what the restore put back. To bring back a single box instead, use its Box history → Restore this version.
+**Data → Restore This Version…** (or the button in Data Versions), while an older version is shown, puts every image's boxes and state back as they were then, as your edits, and starts a new data version (e.g. *Restored v1*; it asks for the name, and to save first if needed). Later versions stay as they are and can still be shown or exported; **Changed in Version** on the new version lists what the restore put back. To bring back a single box instead, use its Box History → Restore this version.
 
 **Data → Compare Data Versions…** reports what changed between two data versions (or a version and the current project): boxes added, deleted and changed, by category and by user, image states changed, and how many images. **List these images** filters the image list to them; **Add to the note** writes the summary line into the later version's note.
 
-**Data → Export Activity (CSV)…** writes, for a date range (UTC days), one row per day and user: boxes drawn, edited, verified, deleted and restored, and images set Verified, Review or Unverified — counted from the saved history.
+**File → Export → Activity (CSV)…** writes, for a date range (UTC days), one row per day and user: boxes drawn, edited, verified, deleted and restored, and images set Verified, Review or Unverified — counted from the saved history.
 
 **Data → Filter → Changed in Version…** lists only images changed during a data version, from when it was added until the next one was, by anyone or by one user. For the current version, unsaved changes count too.
 
-**Settling a merge conflict.** A merge sets an image to **Review** when a box or its image state changed in both copies. Open the box's **Box history** to see both copies' versions in time order, restore the one that makes sense (or edit the box), then set the image state.
+**Settling a merge conflict.** A merge sets an image to **Review** when a box or its image state changed in both copies. Open the box's **Box History** to see both copies' versions in time order, restore the one that makes sense (or edit the box), then set the image state.
 
 **Data → Compact History…** shrinks the history: where a user saved several versions of their own box in a row, only the newest is kept. Versions by other users, deletion records and the version before a deletion are kept; version numbers keep their gaps. It works on saved work only (it asks you to save first), shows how many versions, boxes and images it affects, and cannot be undone. Use it only on the master project after every copy has been merged in: a copy merged later may share only the removed versions, and its boxes would then come in as separate objects (flagged Review).
 
@@ -163,7 +165,7 @@ Two people can work on copies of the same project and merge their work.
 
 Only saved work is merged.
 
-**Data → Merge Project…** (Ctrl+M) merges another saved copy into your saved project. If you have unsaved changes, it asks you to save first. The merged project is then saved at once and becomes a new session: nothing from the merge shows as an unsaved change. (If the save cannot finish, e.g. images from the other copy are elsewhere, add their folder and save.)
+**File → Merge Project…** (Ctrl+M) merges another saved copy into your saved project. If you have unsaved changes, it asks you to save first. The merged project is then saved at once and becomes a new session: nothing from the merge shows as an unsaved change. (If the save cannot finish, e.g. images from the other copy are elsewhere, add their folder and save.)
 
 **At Save.** If someone else saved the project after you opened it, Save offers **Merge…**: your work is versioned as in any save, combined with the file on disk on a separate copy, and written. Your session changes only once the merged file is written; if the save fails or is cancelled, nothing changes.
 
@@ -182,11 +184,11 @@ After a merge, use the **Review** filter to see what needs a look. Undo history 
 
 ## Categories and users
 
-**Data → Categories…** (Ctrl+Shift+C): **Add**, **Edit** (rename; using an existing name offers to merge into it), **Delete** and **Color**. Changes are listed in the dialog and applied together when you click **Save**; **Cancel** drops them. A rename shows the new name on every version. Merging a category into another (or **Delete** on a category boxes use, which moves them) changes the boxes as your edit: each becomes a new version at save, and earlier versions keep the old category, which stays known as "… (merged)" so data versions export exactly as they were. Only a category nothing uses (no box, saved version or undo step) can be deleted. Renaming, merging or moving first shows how many boxes and images it changes and asks to confirm.
+**Edit → Categories…** (Ctrl+Shift+C): **Add**, **Edit** (rename; using an existing name offers to merge into it), **Delete** and **Color**. Changes are listed in the dialog and applied together when you click **Save**; **Cancel** drops them. A rename shows the new name on every version. Merging a category into another (or **Delete** on a category boxes use, which moves them) changes the boxes as your edit: each becomes a new version at save, and earlier versions keep the old category, which stays known as "… (merged)" so data versions export exactly as they were. Only a category nothing uses (no box, saved version or undo step) can be deleted. Renaming, merging or moving first shows how many boxes and images it changes and asks to confirm.
 
-**Data → Users…** (Ctrl+Shift+U): **Add**, **Edit** (rename or merge) and **Delete**, applied together when you click **Save** (**Cancel** drops them). Merging users (the same person under two names) credits all of the merged user's versions and image states, saved ones too, to the user kept. Only a user credited on nothing (no box, saved version, image state or undo step) can be deleted; otherwise merge them into another user. The active user cannot be deleted. Renaming or merging first shows how many boxes and images it changes and asks to confirm. A new user or category never reuses the id of one that was deleted or merged.
+**Edit → Users…** (Ctrl+Shift+U): **Add**, **Edit** (rename or merge) and **Delete**, applied together when you click **Save** (**Cancel** drops them). Merging users (the same person under two names) credits all of the merged user's versions and image states, saved ones too, to the user kept. Only a user credited on nothing (no box, saved version, image state or undo step) can be deleted; otherwise merge them into another user. The active user cannot be deleted. Renaming or merging first shows how many boxes and images it changes and asks to confirm. A new user or category never reuses the id of one that was deleted or merged.
 
-**Data → Import Categories from JSON…** copies category names from another project.
+**Edit → Import Categories…** copies category names from another project or COCO file.
 
 ## Summary
 
@@ -200,16 +202,16 @@ Click a column to sort; **Copy** puts it all on the clipboard for a spreadsheet.
 
 ## Exporting
 
-- **Data → Export Training Dataset…** (Ctrl+Shift+E) — first choose **as of**: the current project or a data version; a data version exports the dataset exactly as it was saved then, without changing the project. Verified images whose boxes are all verified (and verified Background images) to a folder and a plain COCO JSON: standard COCO fields only, without users, states, verification or history. A Verified image that still has unverified boxes is left out (you are told which), because exporting only its verified boxes would teach the model the other objects are background. Exporting again into the same folder asks to replace the images already there. Video frames are written from the video.
-- **File → Export Image…** — the displayed image with its boxes drawn on it.
-- **File → Export Crops…** — each box in the displayed image as its own image.
+- **File → Export → Training Dataset…** (Ctrl+Shift+E) — first choose **as of**: the current project or a data version; a data version exports the dataset exactly as it was saved then, without changing the project. Verified images whose boxes are all verified (and verified Background images) to a folder and a plain COCO JSON: standard COCO box fields only, without users, states, verification, history or segmentation. A Verified image that still has unverified boxes is left out (you are told which), because exporting only its verified boxes would teach the model the other objects are background. Exporting again into the same folder asks to replace the images already there. Video frames are written from the video.
+- **File → Export → Image…** — the displayed image with its boxes drawn on it.
+- **File → Export → Crops…** — each box in the displayed image as its own image.
 
 ## View
 
-- **Image** — brightness, contrast, gamma, black / white points, invert, and auto levels for the current image. **Reset image settings** (Shift+F).
-- **Scale** — rulers, scale bar, pixel resolution, and **Calibrate from line…**: draw across a known length and enter it. The ruler is off until you tick it. Pixel resolution starts as *Not calibrated*: the ruler then counts image pixels and no scale bar can be drawn; once a resolution is set (typed in or calibrated), the ruler shows mm/cm/m and the scale bar becomes available. The resolution applies to this session.
-- **Reference lines while drawing** (Ctrl+R) — horizontal and vertical lines through the cursor in draw mode.
-- **Selected box outline color…**
+- **Image** — brightness, contrast, gamma, black and white points (all sliders), invert, and auto levels for the current image. **Reset Image** (Shift+F).
+- **Scale** — rulers, scale bar, pixel resolution, and **Calibrate from line…**: draw across a known length and enter it. The ruler is off until you tick it. Pixel resolution starts as *Not calibrated*: the ruler then counts image pixels and no scale bar can be drawn; once a resolution is set (typed in or calibrated), the ruler shows one unit chosen from the image's size (µm, mm, cm or m) that stays the same at any zoom, and the scale bar becomes available. The resolution applies to this session.
+- **Reference Lines** (Ctrl+R) — horizontal and vertical lines through the cursor in draw mode.
+- **Selection Color…** — outline color of the selected box.
 
 ## Autosave and recovery
 
@@ -218,6 +220,8 @@ Unsaved work is backed up every 5 minutes, on this computer only. If the app clo
 ## Keyboard shortcuts
 
 Made for the left hand on the keyboard and the right on the mouse. The single keys act while you work in the window, not while typing in a box.
+
+**Edit → Keyboard Shortcuts…** changes the single keys in the first table below (e.g. for a keyboard that is not QWERTY); **Restore Defaults** brings these back. They are kept on this computer, for every project. Arrows, Home / End, Delete, Esc, Enter, Space and the Ctrl shortcuts stay as they are. The tables below list the default keys.
 
 **Mouse** — left button: draw, select, drag; middle button: drag to pan, click for auto levels; wheel: zoom; right button: box menu.
 
@@ -235,7 +239,7 @@ Made for the left hand on the keyboard and the right on the mouse. The single ke
 | **C** | Image: Review ↔ Unverified |
 | **T** | Mark / unmark the image as a favorite (★) |
 | **F** (or middle click) | Automatic black/white levels for this image; again for the defaults |
-| **Shift+F** | Reset image settings |
+| **Shift+F** | Reset image |
 | **G** | Type a frame number (video) |
 | Home / End | First / last frame (video) |
 | Space + drag | Pan |
@@ -252,5 +256,5 @@ Made for the left hand on the keyboard and the right on the mouse. The single ke
 | Ctrl+F | Find (search box) |
 | Ctrl+U | Change user |
 | Ctrl+Shift+C / Ctrl+Shift+U | Edit categories / Edit users |
-| Ctrl+R | Reference lines while drawing |
+| Ctrl+R | Reference lines |
 | F1 | This guide |
