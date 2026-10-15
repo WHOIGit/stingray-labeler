@@ -515,7 +515,10 @@ class AnnotationView(QGraphicsView):
 
     def _create_rubber_band(self, rect: QRectF) -> QGraphicsRectItem:
         rubber_band = ClippedRubberBandItem(rect)  # the second constructor argument is a parent item
-        rubber_band.setPen(QPen(self.draw_color, 2.0, Qt.PenStyle.DashLine))
+        # Drawn like a selected box (what it becomes): the same width on screen at any zoom, and the same color.
+        pen = QPen(self.draw_color, BoxItem.OUTLINE_PX, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        rubber_band.setPen(pen)
         rubber_band.setZValue(20)
         self.scene().addItem(rubber_band)
         return rubber_band
@@ -596,10 +599,11 @@ class AnnotationView(QGraphicsView):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if self.calibration_mode and event.button() == Qt.MouseButton.LeftButton:
             self._calibration_start = self.mapToScene(event.position().toPoint())
+            pen = QPen(QColor(0, 255, 255), BoxItem.OUTLINE_PX, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)  # the same width on screen at any zoom
             self._calibration_line = self.scene().addLine(
                 self._calibration_start.x(), self._calibration_start.y(),
-                self._calibration_start.x(), self._calibration_start.y(),
-                QPen(QColor(0, 255, 255), 2.0, Qt.PenStyle.DashLine),
+                self._calibration_start.x(), self._calibration_start.y(), pen,
             )
             self._calibration_line.setZValue(30)
             event.accept()

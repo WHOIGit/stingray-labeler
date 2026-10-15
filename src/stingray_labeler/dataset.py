@@ -7,6 +7,14 @@ from pathlib import Path
 from typing import Any
 
 
+class OperationCancelled(Exception):
+    """Raised inside a background task when the user presses Cancel."""
+
+
+class FileChangedDuringSave(OSError):
+    """Raised before anything is swapped in when the project file changed while this save was running."""
+
+
 def is_verified(value: Any) -> bool:
     """Treat absent legacy verification metadata as verified."""
     if isinstance(value, bool):
