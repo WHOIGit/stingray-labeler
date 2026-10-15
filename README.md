@@ -2,6 +2,8 @@
 
 Stingray Labeler is a desktop application for reviewing images and creating bounding-box annotations with named labels. It runs from the Linux or Windows command line and can be packaged as a Windows executable.
 
+![Stingray Labeler reviewing boxes on a shadowgraph image](docs/stingray-labeler.png)
+
 ## Windows executable
 
 Download the latest Windows build from [GitHub Releases](https://github.com/WHOIGit/stingray-labeler/releases/latest). The executable can be run directly; Python does not need to be installed on the target computer.
